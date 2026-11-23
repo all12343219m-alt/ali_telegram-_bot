@@ -1,4 +1,2 @@
-
 python-telegram-bot[webhooks]==22.5
-google-genai
-
+openai>=1.99.0
