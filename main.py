@@ -1,9 +1,8 @@
+
 import os
-import re
 import json
 import sqlite3
 import logging
-import hashlib
 from datetime import datetime, timezone
 
 from telegram import (
@@ -20,19 +19,25 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from openai import AsyncOpenAI
+
+from google import genai
+from google.genai import types
 
 
-# =========================================================
-# إعدادات البوت
-# =========================================================
+# =========================
+# الإعدادات
+# =========================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.5").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
-DATABASE_PATH = os.environ.get("DATABASE_PATH", "bot_data.db")
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-pro"
+).strip()
+
+ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
+DATABASE_PATH = os.getenv("DATABASE_PATH", "bot_data.db")
 
 TELEGRAM_LINK = "https://t.me/alsvdbdbdhdhdjhfh"
 INSTAGRAM_LINK = "https://www.instagram.com/2a3ka?hvrq=dDZhdjFsajJ1NHV6"
@@ -48,9 +53,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# =========================================================
+# =========================
 # قاعدة البيانات
-# =========================================================
+# =========================
 
 def get_db():
     return sqlite3.connect(DATABASE_PATH)
@@ -90,7 +95,8 @@ def save_user(user):
 
     with get_db() as db:
         db.execute("""
-            INSERT INTO users (user_id, username, first_name, joined_at)
+            INSERT INTO users
+            (user_id, username, first_name, joined_at)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username = excluded.username,
@@ -106,7 +112,8 @@ def save_user(user):
 def save_suggestion(user_id, suggestion):
     with get_db() as db:
         db.execute("""
-            INSERT INTO suggestions (user_id, suggestion, created_at)
+            INSERT INTO suggestions
+            (user_id, suggestion, created_at)
             VALUES (?, ?, ?)
         """, (
             user_id,
@@ -127,13 +134,12 @@ def get_history(user_id):
 
     try:
         return json.loads(row[0])
-    except (json.JSONDecodeError, TypeError):
+    except Exception:
         return []
 
 
 def save_history(user_id, history):
-    # الاحتفاظ بآخر 10 رسائل فقط لتقليل استهلاك API
-    history = history[-10:]
+    history = history[-12:]
 
     with get_db() as db:
         db.execute("""
@@ -141,7 +147,10 @@ def save_history(user_id, history):
             VALUES (?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 history = excluded.history
-        """, (user_id, json.dumps(history, ensure_ascii=False)))
+        """, (
+            user_id,
+            json.dumps(history, ensure_ascii=False),
+        ))
 
 
 def clear_history(user_id):
@@ -152,37 +161,37 @@ def clear_history(user_id):
         )
 
 
-# =========================================================
-# القوائم والأزرار
-# =========================================================
+# =========================
+# القائمة الرئيسية
+# =========================
 
 def main_menu():
     keyboard = [
         [
             InlineKeyboardButton(
-                "🤖 اسأل الذكاء الاصطناعي",
+                "🧠 تحدث مع Gemini",
                 callback_data="ask",
             )
         ],
         [
             InlineKeyboardButton(
-                "👨‍💻 معلومات المطور",
+                "👨‍💻 المطور",
                 callback_data="developer",
             ),
             InlineKeyboardButton(
-                "📊 معلومات البوت",
+                "ℹ️ معلومات البوت",
                 callback_data="info",
             ),
         ],
         [
             InlineKeyboardButton(
-                "💡 إرسال اقتراح",
+                "💡 اقتراح",
                 callback_data="suggest",
             ),
         ],
         [
             InlineKeyboardButton(
-                "📱 تيليغرام المطور",
+                "📱 تيليغرام",
                 url=TELEGRAM_LINK,
             ),
             InlineKeyboardButton(
@@ -201,9 +210,9 @@ def main_menu():
     return InlineKeyboardMarkup(keyboard)
 
 
-# =========================================================
-# أمر البداية
-# =========================================================
+# =========================
+# البداية والمساعدة
+# =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -211,74 +220,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = user.first_name or "صديقي"
 
-    text = (
-        f"أهلًا وسهلًا بك يا {name} 👋\n\n"
-        "أنا بوت مساعد ذكي، أستطيع مساعدتك في:\n\n"
-        "🤖 الإجابة عن الأسئلة\n"
-        "💻 البرمجة والتقنية\n"
-        "📚 المعلومات العامة\n"
-        "💡 استقبال اقتراحاتك\n\n"
-        "اختر ما تريد من القائمة التالية:"
-    )
-
     await update.effective_message.reply_text(
-        text,
+        f"أهلًا بك يا {name} 👋\n\n"
+        "أنا مساعدك الذكي المدعوم من Google Gemini.\n\n"
+        "💻 أساعدك في البرمجة والتقنية.\n"
+        "📚 أجيب عن الأسئلة العامة.\n"
+        "🧠 أتذكر سياق محادثتنا.\n"
+        "💡 أستقبل اقتراحاتك.\n\n"
+        "اختر من القائمة:",
         reply_markup=main_menu(),
     )
 
 
-# =========================================================
-# المساعدة
-# =========================================================
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+    await update.effective_message.reply_text(
         "📖 أوامر البوت:\n\n"
         "/start - تشغيل البوت\n"
-        "/help - عرض المساعدة\n"
+        "/help - المساعدة\n"
         "/info - معلومات البوت\n"
-        "/ask سؤالك - سؤال الذكاء الاصطناعي\n"
+        "/ask سؤالك - سؤال Gemini\n"
         "/reset - مسح ذاكرة المحادثة\n"
-        "/suggest اقتراحك - إرسال اقتراح\n\n"
-        "مثال:\n"
-        "/ask كيف أتعلم البرمجة؟"
+        "/suggest اقتراحك - إرسال اقتراح\n"
+        "/admin - لوحة الإدارة\n"
+        "/stats - الإحصائيات\n\n"
+        "يمكنك أيضًا إرسال سؤالك مباشرة."
     )
 
-    await update.effective_message.reply_text(text)
-
-
-# =========================================================
-# معلومات البوت
-# =========================================================
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📊 معلومات البوت\n\n"
-        "الاسم: المساعد الذكي\n"
-        "اللغة: العربية\n"
-        "الذكاء الاصطناعي: OpenAI\n"
-        "الاستضافة: Render\n\n"
-        "تم تطوير البوت لخدمة المستخدمين "
-        "وتقديم المساعدة التقنية والمعلوماتية."
+    await update.effective_message.reply_text(
+        "🤖 معلومات البوت\n\n"
+        "محرك الذكاء: Google Gemini\n"
+        f"النموذج: {GEMINI_MODEL}\n"
+        "الاستضافة: Render\n"
+        "اللغة: العربية"
     )
 
-    await update.effective_message.reply_text(text)
-
-
-# =========================================================
-# معلومات المطور
-# =========================================================
 
 async def developer_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    text = (
-        "👨‍💻 معلومات المطور\n\n"
-        f"{DEVELOPER_BIO}\n\n"
-        "يمكنك التواصل مع المطور عبر الروابط التالية:"
-    )
-
     keyboard = [
         [InlineKeyboardButton("📱 تيليغرام", url=TELEGRAM_LINK)],
         [InlineKeyboardButton("📸 إنستغرام", url=INSTAGRAM_LINK)],
@@ -286,14 +268,14 @@ async def developer_command(
     ]
 
     await update.effective_message.reply_text(
-        text,
+        f"👨‍💻 {DEVELOPER_BIO}",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-# =========================================================
+# =========================
 # الاقتراحات
-# =========================================================
+# =========================
 
 async def suggest_command(
     update: Update,
@@ -306,28 +288,146 @@ async def suggest_command(
 
     if not suggestion:
         await update.effective_message.reply_text(
-            "💡 أرسل اقتراحك بهذا الشكل:\n"
+            "اكتب اقتراحك بهذا الشكل:\n"
             "/suggest أريد إضافة ميزة جديدة"
         )
         return
 
     if len(suggestion) > 1500:
         await update.effective_message.reply_text(
-            "الاقتراح طويل جدًا. اختصره قليلًا."
+            "الاقتراح طويل جدًا، اختصره قليلًا."
         )
         return
 
     save_suggestion(user.id, suggestion)
 
     await update.effective_message.reply_text(
-        "✅ تم استلام اقتراحك بنجاح.\n"
-        "شكرًا لمساعدتنا على تطوير البوت!"
+        "✅ وصل اقتراحك بنجاح، شكرًا لك!"
     )
 
 
-# =========================================================
-# الذكاء الاصطناعي
-# =========================================================
+# =========================
+# Gemini AI
+# =========================
+
+async def ask_gemini(update: Update, prompt: str):
+    user = update.effective_user
+    user_id = user.id
+
+    if not GEMINI_API_KEY:
+        await update.effective_message.reply_text(
+            "⚠️ Gemini غير مفعّل.\n"
+            "أضف GEMINI_API_KEY في Render."
+        )
+        return
+
+    if len(prompt) > 8000:
+        await update.effective_message.reply_text(
+            "السؤال طويل جدًا، أرسل سؤالًا أقصر."
+        )
+        return
+
+    status = await update.effective_message.reply_text(
+        "✨ Gemini يفكر في إجابتك..."
+    )
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        history = get_history(user_id)
+
+        contents = []
+
+        for item in history:
+            role = item.get("role")
+            text = item.get("content", "")
+
+            if not text:
+                continue
+
+            if role == "user":
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=text)],
+                    )
+                )
+
+            elif role == "assistant":
+                contents.append(
+                    types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text=text)],
+                    )
+                )
+
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=prompt)],
+            )
+        )
+
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "أنت مساعد ذكي وودود داخل بوت تيليغرام. "
+                    "أجب باللغة العربية الواضحة. "
+                    "ساعد في البرمجة والتقنية والأسئلة العامة. "
+                    "اشرح بشكل مفيد ومنظم. "
+                    "إذا لم تعرف الإجابة، قل ذلك بوضوح. "
+                    "لا تدّع تنفيذ إجراءات خارج المحادثة."
+                ),
+                temperature=0.7,
+            ),
+        )
+
+        answer = (response.text or "").strip()
+
+        if not answer:
+            answer = "لم أتمكن من إنشاء إجابة، حاول مرة أخرى."
+
+        history.append({
+            "role": "user",
+            "content": prompt,
+        })
+
+        history.append({
+            "role": "assistant",
+            "content": answer,
+        })
+
+        save_history(user_id, history)
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        for i in range(0, len(answer), 4000):
+            await update.effective_message.reply_text(
+                answer[i:i + 4000]
+            )
+
+    except Exception:
+        logger.exception("Gemini request failed")
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        await update.effective_message.reply_text(
+            "❌ تعذر الاتصال بـ Gemini.\n\n"
+            "تحقق من:\n"
+            "1. صحة مفتاح Gemini.\n"
+            "2. اسم النموذج.\n"
+            "3. حدود الاستخدام المجاني.\n"
+            "4. سجل الأخطاء في Render."
+        )
+
 
 async def ask_command(
     update: Update,
@@ -340,118 +440,33 @@ async def ask_command(
 
     if not prompt:
         await update.effective_message.reply_text(
-            "🧠 اكتب سؤالك بعد الأمر:\n\n"
-            "/ask اشرح لي الذكاء الاصطناعي"
+            "اكتب سؤالك بهذا الشكل:\n"
+            "/ask اشرح لي البرمجة"
         )
         return
 
-    if not OPENAI_API_KEY:
-        await update.effective_message.reply_text(
-            "⚠️ الذكاء الاصطناعي غير مفعّل حاليًا.\n"
-            "يرجى إضافة OPENAI_API_KEY في إعدادات Render."
-        )
-        return
+    await ask_gemini(update, prompt)
 
-    if len(prompt) > 8000:
-        await update.effective_message.reply_text(
-            "السؤال طويل جدًا. أرسل سؤالًا أقصر."
-        )
-        return
-
-    status = await update.effective_message.reply_text(
-        "🧠 لحظة، أفكر في إجابتك..."
-    )
-
-    try:
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-        history = get_history(user.id)
-
-        conversation = history + [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ]
-
-        response = await client.responses.create(
-            model=OPENAI_MODEL,
-            instructions=(
-                "أنت مساعد ذكي داخل بوت تيليغرام. "
-                "أجب باللغة العربية الواضحة والودودة. "
-                "استخدم اللهجة العربية البسيطة عند الحاجة. "
-                "ساعد في البرمجة والتقنية والأسئلة العامة. "
-                "إذا لم تكن متأكدًا من معلومة، وضح ذلك. "
-                "لا تدّع أنك نفذت إجراءً خارج المحادثة."
-            ),
-            input=conversation,
-        )
-
-        answer = (response.output_text or "").strip()
-
-        if not answer:
-            answer = "لم أتمكن من إنشاء إجابة. حاول مرة أخرى."
-
-        history.append({"role": "user", "content": prompt})
-        history.append({"role": "assistant", "content": answer})
-        save_history(user.id, history)
-
-        try:
-            await status.delete()
-        except Exception:
-            pass
-
-        # تيليغرام يسمح برسالة نصية حتى 4096 حرفًا تقريبًا
-        for i in range(0, len(answer), 4000):
-            await update.effective_message.reply_text(
-                answer[i:i + 4000]
-            )
-
-    except Exception:
-        logger.exception("OpenAI request failed")
-
-        try:
-            await status.delete()
-        except Exception:
-            pass
-
-        await update.effective_message.reply_text(
-            "❌ حدث خطأ أثناء الاتصال بالذكاء الاصطناعي.\n\n"
-            "تأكد من:\n"
-            "1. صحة مفتاح OpenAI.\n"
-            "2. وجود رصيد API.\n"
-            "3. صحة اسم النموذج في OPENAI_MODEL.\n"
-            "4. نجاح تشغيل البوت على Render."
-        )
-
-
-# =========================================================
-# مسح ذاكرة المحادثة
-# =========================================================
 
 async def reset_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user = update.effective_user
-    clear_history(user.id)
+    clear_history(update.effective_user.id)
 
     await update.effective_message.reply_text(
-        "🧹 تم مسح ذاكرة محادثتك مع الذكاء الاصطناعي."
+        "🧹 تم مسح ذاكرة محادثتك مع Gemini."
     )
 
 
-# =========================================================
-# لوحة الإدارة
-# =========================================================
+# =========================
+# الإدارة
+# =========================
 
 def is_admin(user_id):
-    if not ADMIN_ID:
-        return False
-
     try:
-        return int(ADMIN_ID) == int(user_id)
-    except (TypeError, ValueError):
+        return ADMIN_ID and int(ADMIN_ID) == int(user_id)
+    except Exception:
         return False
 
 
@@ -459,37 +474,26 @@ async def admin_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user = update.effective_user
-
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         await update.effective_message.reply_text(
-            "⛔ هذا الأمر مخصص للإدارة."
+            "⛔ هذا الأمر للإدارة فقط."
         )
         return
 
-    text = (
+    await update.effective_message.reply_text(
         "👑 لوحة الإدارة\n\n"
-        "الأوامر المتاحة:\n"
         "/stats - إحصائيات البوت\n"
-        "/broadcast رسالتك - إرسال رسالة للجميع"
+        "/broadcast رسالتك - بث رسالة"
     )
 
-    await update.effective_message.reply_text(text)
-
-
-# =========================================================
-# إحصائيات البوت
-# =========================================================
 
 async def stats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user = update.effective_user
-
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         await update.effective_message.reply_text(
-            "⛔ هذا الأمر مخصص للإدارة."
+            "⛔ هذا الأمر للإدارة فقط."
         )
         return
 
@@ -502,28 +506,20 @@ async def stats_command(
             "SELECT COUNT(*) FROM suggestions"
         ).fetchone()[0]
 
-    text = (
+    await update.effective_message.reply_text(
         "📊 إحصائيات البوت\n\n"
-        f"👥 عدد المستخدمين: {users_count}\n"
-        f"💡 عدد الاقتراحات: {suggestions_count}"
+        f"👥 المستخدمون: {users_count}\n"
+        f"💡 الاقتراحات: {suggestions_count}"
     )
 
-    await update.effective_message.reply_text(text)
-
-
-# =========================================================
-# بث رسالة لجميع المستخدمين
-# =========================================================
 
 async def broadcast_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user = update.effective_user
-
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         await update.effective_message.reply_text(
-            "⛔ هذا الأمر مخصص للإدارة."
+            "⛔ هذا الأمر للإدارة فقط."
         )
         return
 
@@ -531,13 +527,12 @@ async def broadcast_command(
 
     if not message:
         await update.effective_message.reply_text(
-            "استخدم الأمر بهذا الشكل:\n"
-            "/broadcast مرحبًا بكم في البوت"
+            "استخدم:\n/broadcast مرحبًا بكم"
         )
         return
 
     with get_db() as db:
-        rows = db.execute(
+        users = db.execute(
             "SELECT user_id FROM users"
         ).fetchall()
 
@@ -545,33 +540,29 @@ async def broadcast_command(
     failed = 0
 
     await update.effective_message.reply_text(
-        f"📢 بدأ إرسال الرسالة إلى {len(rows)} مستخدم."
+        f"📢 بدأ البث إلى {len(users)} مستخدم."
     )
 
-    for row in rows:
-        user_id = row[0]
-
+    for row in users:
         try:
             await context.bot.send_message(
-                chat_id=user_id,
+                chat_id=row[0],
                 text=message,
             )
             success += 1
-
         except Exception:
             failed += 1
-            logger.warning("Broadcast failed for user %s", user_id)
 
     await update.effective_message.reply_text(
-        "✅ انتهى البث.\n\n"
-        f"تم الإرسال: {success}\n"
-        f"فشل الإرسال: {failed}"
+        f"انتهى البث.\n"
+        f"نجح: {success}\n"
+        f"فشل: {failed}"
     )
 
 
-# =========================================================
-# أزرار القائمة
-# =========================================================
+# =========================
+# الأزرار
+# =========================
 
 async def button_handler(
     update: Update,
@@ -580,51 +571,30 @@ async def button_handler(
     query = update.callback_query
     await query.answer()
 
-    user = query.from_user
-    save_user(user)
+    save_user(query.from_user)
 
     if query.data == "ask":
         await query.message.reply_text(
-            "🤖 اكتب سؤالك بهذا الشكل:\n\n"
-            "/ask كيف أتعلم البرمجة؟"
+            "🧠 أرسل سؤالك مباشرة أو استخدم:\n"
+            "/ask اشرح لي الذكاء الاصطناعي"
         )
 
     elif query.data == "developer":
-        await query.message.reply_text(
-            f"👨‍💻 {DEVELOPER_BIO}\n\n"
-            "روابط المطور:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "📱 تيليغرام",
-                    url=TELEGRAM_LINK,
-                )],
-                [InlineKeyboardButton(
-                    "📸 إنستغرام",
-                    url=INSTAGRAM_LINK,
-                )],
-                [InlineKeyboardButton(
-                    "🌐 الموقع",
-                    url=WEBSITE_LINK,
-                )],
-            ]),
-        )
+        await developer_command(update, context)
 
     elif query.data == "info":
-        await query.message.reply_text(
-            "📊 بوت مساعد ذكي باللغة العربية.\n"
-            "يعمل باستخدام OpenAI وTelegram."
-        )
+        await info_command(update, context)
 
     elif query.data == "suggest":
         await query.message.reply_text(
-            "💡 أرسل اقتراحك بهذا الشكل:\n\n"
-            "/suggest أريد إضافة ميزة جديدة"
+            "💡 أرسل اقتراحك بهذا الشكل:\n"
+            "/suggest اقتراحي هو..."
         )
 
 
-# =========================================================
-# استقبال الرسائل العادية
-# =========================================================
+# =========================
+# الرسائل العادية
+# =========================
 
 async def text_handler(
     update: Update,
@@ -633,25 +603,22 @@ async def text_handler(
     user = update.effective_user
     save_user(user)
 
-    await update.effective_message.reply_text(
-        "وصلت رسالتك 👋\n\n"
-        "للتحدث مع الذكاء الاصطناعي، استخدم:\n"
-        "/ask ثم اكتب سؤالك.\n\n"
-        "مثال:\n"
-        "/ask اشرح لي بايثون"
-    )
+    prompt = (update.effective_message.text or "").strip()
+
+    if prompt:
+        await ask_gemini(update, prompt)
 
 
-# =========================================================
-# إعداد أوامر البوت
-# =========================================================
+# =========================
+# أوامر تيليغرام
+# =========================
 
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "تشغيل البوت"),
         BotCommand("help", "المساعدة"),
         BotCommand("info", "معلومات البوت"),
-        BotCommand("ask", "اسأل الذكاء الاصطناعي"),
+        BotCommand("ask", "اسأل Gemini"),
         BotCommand("reset", "مسح ذاكرة المحادثة"),
         BotCommand("suggest", "إرسال اقتراح"),
         BotCommand("admin", "لوحة الإدارة"),
@@ -659,15 +626,13 @@ async def post_init(application: Application):
     ])
 
 
-# =========================================================
-# تشغيل البوت على Render
-# =========================================================
+# =========================
+# تشغيل Render
+# =========================
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN غير موجود في Environment Variables"
-        )
+        raise RuntimeError("BOT_TOKEN غير موجود")
 
     init_db()
 
@@ -699,14 +664,15 @@ def main():
         )
     )
 
-    external_url = os.environ.get(
+    external_url = os.getenv(
         "RENDER_EXTERNAL_URL", ""
     ).strip().rstrip("/")
 
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.getenv("PORT", "10000"))
 
     if external_url:
-        # إنشاء مسار Webhook آمن دون كشف توكن البوت
+        import hashlib
+
         webhook_path = hashlib.sha256(
             BOT_TOKEN.encode()
         ).hexdigest()[:32]
@@ -715,23 +681,15 @@ def main():
             (BOT_TOKEN + "telegram-webhook").encode()
         ).hexdigest()[:32]
 
-        webhook_url = (
-            f"{external_url}/{webhook_path}"
-        )
-
-        logger.info("Starting Telegram webhook")
-
         application.run_webhook(
             listen="0.0.0.0",
             port=port,
             url_path=webhook_path,
-            webhook_url=webhook_url,
+            webhook_url=f"{external_url}/{webhook_path}",
             secret_token=webhook_secret,
             bootstrap_retries=-1,
         )
-
     else:
-        logger.info("Starting Telegram polling")
         application.run_polling()
 
 
