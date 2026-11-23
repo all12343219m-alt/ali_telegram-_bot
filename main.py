@@ -1,14 +1,16 @@
-
 import os
-import logging
+import re
+import json
 import sqlite3
+import logging
+import hashlib
 from datetime import datetime, timezone
 
 from telegram import (
     Update,
-    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
 )
 from telegram.ext import (
     Application,
@@ -18,99 +20,169 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from openai import AsyncOpenAI
 
-TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-PORT = int(os.environ.get("PORT", "10000"))
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
-DB_PATH = os.environ.get("DB_PATH", "bot_data.sqlite3")
+
+# =========================================================
+# إعدادات البوت
+# =========================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.5").strip()
+
+ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "bot_data.db")
 
 TELEGRAM_LINK = "https://t.me/alsvdbdbdhdhdjhfh"
 INSTAGRAM_LINK = "https://www.instagram.com/2a3ka?hvrq=dDZhdjFsajJ1NHV6"
 WEBSITE_LINK = "https://astounding-seahorse-021ea5.netlify.app/"
 
+DEVELOPER_BIO = "شاب سوري شغوف بالبرمجة ويسعى لإتقانها"
+
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
+# =========================================================
+# قاعدة البيانات
+# =========================================================
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            joined_at TEXT
-        )
-    """)
+def get_db():
+    return sqlite3.connect(DATABASE_PATH)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS suggestions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message TEXT,
-            created_at TEXT
-        )
-    """)
 
-    return conn
+def init_db():
+    with get_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                joined_at TEXT
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                suggestion TEXT,
+                created_at TEXT
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                user_id INTEGER PRIMARY KEY,
+                history TEXT
+            )
+        """)
 
 
 def save_user(user):
     if not user:
         return
 
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO users
-            (user_id, username, first_name, joined_at)
-            VALUES (
-                ?, ?, ?,
-                COALESCE(
-                    (SELECT joined_at FROM users WHERE user_id=?),
-                    ?
-                )
-            )
-            """,
-            (
-                user.id,
-                user.username or "",
-                user.first_name or "",
-                user.id,
-                datetime.now(timezone.utc).isoformat(),
-            ),
+    with get_db() as db:
+        db.execute("""
+            INSERT INTO users (user_id, username, first_name, joined_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            datetime.now(timezone.utc).isoformat(),
+        ))
+
+
+def save_suggestion(user_id, suggestion):
+    with get_db() as db:
+        db.execute("""
+            INSERT INTO suggestions (user_id, suggestion, created_at)
+            VALUES (?, ?, ?)
+        """, (
+            user_id,
+            suggestion,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+
+
+def get_history(user_id):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT history FROM chat_history WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+    if not row:
+        return []
+
+    try:
+        return json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def save_history(user_id, history):
+    # الاحتفاظ بآخر 10 رسائل فقط لتقليل استهلاك API
+    history = history[-10:]
+
+    with get_db() as db:
+        db.execute("""
+            INSERT INTO chat_history (user_id, history)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                history = excluded.history
+        """, (user_id, json.dumps(history, ensure_ascii=False)))
+
+
+def clear_history(user_id):
+    with get_db() as db:
+        db.execute(
+            "DELETE FROM chat_history WHERE user_id = ?",
+            (user_id,),
         )
 
 
-def user_count():
-    with db() as conn:
-        return conn.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
+# =========================================================
+# القوائم والأزرار
+# =========================================================
 
-
-def home_keyboard():
+def main_menu():
     keyboard = [
         [
             InlineKeyboardButton(
-                "⚡ مركز الأوامر",
-                callback_data="commands",
+                "🤖 اسأل الذكاء الاصطناعي",
+                callback_data="ask",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👨‍💻 معلومات المطور",
+                callback_data="developer",
             ),
             InlineKeyboardButton(
-                "👨‍💻 المطوّر",
-                callback_data="developer",
+                "📊 معلومات البوت",
+                callback_data="info",
             ),
         ],
         [
             InlineKeyboardButton(
-                "📢 تيليغرام",
+                "💡 إرسال اقتراح",
+                callback_data="suggest",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📱 تيليغرام المطور",
                 url=TELEGRAM_LINK,
             ),
             InlineKeyboardButton(
@@ -120,738 +192,338 @@ def home_keyboard():
         ],
         [
             InlineKeyboardButton(
-                "🌐 موقع المطوّر",
+                "🌐 الموقع",
                 url=WEBSITE_LINK,
             ),
         ],
-        [
-            InlineKeyboardButton(
-                "💡 اقتراح أو مشكلة",
-                callback_data="suggest",
-            ),
-        ],
     ]
 
     return InlineKeyboardMarkup(keyboard)
 
 
-def admin_keyboard():
+# =========================================================
+# أمر البداية
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+
+    name = user.first_name or "صديقي"
+
+    text = (
+        f"أهلًا وسهلًا بك يا {name} 👋\n\n"
+        "أنا بوت مساعد ذكي، أستطيع مساعدتك في:\n\n"
+        "🤖 الإجابة عن الأسئلة\n"
+        "💻 البرمجة والتقنية\n"
+        "📚 المعلومات العامة\n"
+        "💡 استقبال اقتراحاتك\n\n"
+        "اختر ما تريد من القائمة التالية:"
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        reply_markup=main_menu(),
+    )
+
+
+# =========================================================
+# المساعدة
+# =========================================================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📖 أوامر البوت:\n\n"
+        "/start - تشغيل البوت\n"
+        "/help - عرض المساعدة\n"
+        "/info - معلومات البوت\n"
+        "/ask سؤالك - سؤال الذكاء الاصطناعي\n"
+        "/reset - مسح ذاكرة المحادثة\n"
+        "/suggest اقتراحك - إرسال اقتراح\n\n"
+        "مثال:\n"
+        "/ask كيف أتعلم البرمجة؟"
+    )
+
+    await update.effective_message.reply_text(text)
+
+
+# =========================================================
+# معلومات البوت
+# =========================================================
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📊 معلومات البوت\n\n"
+        "الاسم: المساعد الذكي\n"
+        "اللغة: العربية\n"
+        "الذكاء الاصطناعي: OpenAI\n"
+        "الاستضافة: Render\n\n"
+        "تم تطوير البوت لخدمة المستخدمين "
+        "وتقديم المساعدة التقنية والمعلوماتية."
+    )
+
+    await update.effective_message.reply_text(text)
+
+
+# =========================================================
+# معلومات المطور
+# =========================================================
+
+async def developer_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    text = (
+        "👨‍💻 معلومات المطور\n\n"
+        f"{DEVELOPER_BIO}\n\n"
+        "يمكنك التواصل مع المطور عبر الروابط التالية:"
+    )
+
     keyboard = [
-        [
-            InlineKeyboardButton(
-                "📊 الإحصائيات",
-                callback_data="admin_stats",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📣 طريقة الإذاعة",
-                callback_data="admin_broadcast",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🏠 الرئيسية",
-                callback_data="home",
-            ),
-        ],
+        [InlineKeyboardButton("📱 تيليغرام", url=TELEGRAM_LINK)],
+        [InlineKeyboardButton("📸 إنستغرام", url=INSTAGRAM_LINK)],
+        [InlineKeyboardButton("🌐 الموقع", url=WEBSITE_LINK)],
     ]
 
-    return InlineKeyboardMarkup(keyboard)
-
-
-def is_admin(user):
-    return bool(
-        user
-        and ADMIN_ID
-        and user.id == ADMIN_ID
-    )
-
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    save_user(update.effective_user)
-
     await update.effective_message.reply_text(
-        "✨ أهلاً بك في مركز المطوّر الرقمي!\n\n"
-        "أنا بوت شخصي قيد التطوير.\n"
-        "اختر ما تريد من القائمة:",
-        reply_markup=home_keyboard(),
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-async def help_command(
+# =========================================================
+# الاقتراحات
+# =========================================================
+
+async def suggest_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    save_user(update.effective_user)
+    user = update.effective_user
+    save_user(user)
 
-    await update.effective_message.reply_text(
-        "📋 أوامر البوت:\n\n"
-        "/start — القائمة الرئيسية\n"
-        "/help — المساعدة\n"
-        "/info — معلومات البوت\n"
-        "/suggest — إرسال اقتراح\n"
-        "/ask — سؤال المساعد\n\n"
-        "أوامر الإدارة:\n"
-        "/admin — لوحة المطوّر\n"
-        "/stats — إحصائيات البوت\n"
-        "/broadcast — إرسال رسالة جماعية",
-        reply_markup=home_keyboard(),
-    )
+    suggestion = " ".join(context.args).strip()
 
-
-async def info(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    save_user(update.effective_user)
-
-    await update.effective_message.reply_text(
-        "🤖 ALI • DIGITAL CORE\n\n"
-        "بوت شخصي لاستقبال الأوامر "
-        "وتقديم أدوات مفيدة.\n"
-        "يتم تطويره باستمرار.",
-        reply_markup=home_keyboard(),
-    )
-
-
-async def developer(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.effective_message.reply_text(
-        "👨‍💻 معلومات المطوّر\n\n"
-        "شاب سوري شغوف بالبرمجة "
-        "ويسعى لإتقانها. 🇸🇾\n\n"
-        "التعلّم مستمر والطموح لا يتوقف.",
-        reply_markup=home_keyboard(),
-    )
-
-
-async def suggest(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    save_user(update.effective_user)
-
-    message = " ".join(context.args).strip()
-
-    if not message:
+    if not suggestion:
         await update.effective_message.reply_text(
-            "اكتب اقتراحك بهذا الشكل:\n"
-            "/suggest أضيفوا ميزة جديدة"
+            "💡 أرسل اقتراحك بهذا الشكل:\n"
+            "/suggest أريد إضافة ميزة جديدة"
         )
         return
 
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO suggestions
-            (user_id, message, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (
-                update.effective_user.id,
-                message,
-                datetime.now(timezone.utc).isoformat(),
-            ),
+    if len(suggestion) > 1500:
+        await update.effective_message.reply_text(
+            "الاقتراح طويل جدًا. اختصره قليلًا."
         )
+        return
 
-    if ADMIN_ID:
-        user = update.effective_user
-
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"💡 اقتراح جديد\n"
-                f"الاسم: {user.full_name}\n"
-                f"المعرف: {user.id}\n\n"
-                f"{message}",
-            )
-        except Exception:
-            log.exception(
-                "Could not notify admin"
-            )
+    save_suggestion(user.id, suggestion)
 
     await update.effective_message.reply_text(
-        "وصل اقتراحك، شكرًا لمساهمتك 💛"
+        "✅ تم استلام اقتراحك بنجاح.\n"
+        "شكرًا لمساعدتنا على تطوير البوت!"
     )
 
 
-async def admin(
+# =========================================================
+# الذكاء الاصطناعي
+# =========================================================
+
+async def ask_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update.effective_user):
-        await update.effective_message.reply_text(
-            "هذا الأمر مخصص للمطوّر فقط 🔒"
-        )
-        return
-
-    await update.effective_message.reply_text(
-        "🛡️ لوحة تحكم المطوّر\n"
-        "اختر إحدى الأدوات:",
-        reply_markup=admin_keyboard(),
-    )
-
-
-async def stats(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user):
-        await update.effective_message.reply_text(
-            "غير مصرح لك 🔒"
-        )
-        return
-
-    await update.effective_message.reply_text(
-        f"📊 إحصائيات البوت\n\n"
-        f"👥 المستخدمون المسجلون: {user_count()}"
-    )
-
-
-async def broadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user):
-        await update.effective_message.reply_text(
-            "غير مصرح لك 🔒"
-        )
-        return
-
-    message = " ".join(context.args).strip()
-
-    if not message:
-        await update.effective_message.reply_text(
-            "استخدم الأمر هكذا:\n"
-            "/broadcast رسالتك لجميع المستخدمين"
-        )
-        return
-
-    with db() as conn:
-        ids = [
-            row[0]
-            for row in conn.execute(
-                "SELECT user_id FROM users"
-            ).fetchall()
-        ]
-
-    sent = 0
-    failed = 0
-
-    status = await update.effective_message.reply_text(
-        "⏳ جارٍ إرسال الرسالة..."
-    )
-
-    for user_id in ids:
-        try:
-            await context.bot.send_message(
-                user_id,
-                message,
-            )
-            sent += 1
-
-        except Exception:
-            failed += 1
-
-    await status.edit_text(
-        f"✅ انتهى الإرسال\n"
-        f"وصلت: {sent}\n"
-        f"تعذّر: {failed}"
-    )
-
-
-async def ask(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    save_user(update.effective_user)
+    user = update.effective_user
+    save_user(user)
 
     prompt = " ".join(context.args).strip()
 
     if not prompt:
         await update.effective_message.reply_text(
-            "اكتب سؤالك بعد الأمر /ask"
+            "🧠 اكتب سؤالك بعد الأمر:\n\n"
+            "/ask اشرح لي الذكاء الاصطناعي"
         )
         return
 
-    await update.effective_message.reply_text(
-        "🧠 ميزة الذكاء الاصطناعي "
-        "غير مربوطة حاليًا.\n\n"
-        "سيتم تفعيلها عند إضافة "
-        "خدمة الذكاء الاصطناعي."
-    )
-
-
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    data = query.data
-
-    if data == "home":
-        await query.message.reply_text(
-            "🏠 القائمة الرئيسية:",
-            reply_markup=home_keyboard(),
+    if not OPENAI_API_KEY:
+        await update.effective_message.reply_text(
+            "⚠️ الذكاء الاصطناعي غير مفعّل حاليًا.\n"
+            "يرجى إضافة OPENAI_API_KEY في إعدادات Render."
         )
-
-    elif data == "commands":
-        await query.message.reply_text(
-            "⚡ مركز الأوامر\n\n"
-            "/start — الرئيسية\n"
-            "/help — المساعدة\n"
-            "/info — معلومات البوت\n"
-            "/suggest — إرسال اقتراح\n"
-            "/ask — سؤال المساعد",
-            reply_markup=home_keyboard(),
-        )
-
-    elif data == "developer":
-        await developer(update, context)
-
-    elif data == "suggest":
-        await query.message.reply_text(
-            "💡 لإرسال اقتراح أو مشكلة:\n"
-            "/suggest ثم اكتب رسالتك"
-        )
-
-    elif data.startswith("admin_"):
-        if not is_admin(query.from_user):
-            await query.message.reply_text(
-                "هذا القسم للمطوّر فقط 🔒"
-            )
-            return
-
-        if data == "admin_stats":
-            await query.message.reply_text(
-                f"📊 المستخدمون المسجلون: "
-                f"{user_count()}",
-                reply_markup=admin_keyboard(),
-            )
-
-        elif data == "admin_broadcast":
-            await query.message.reply_text(
-                "📣 للإذاعة اكتب:\n"
-                "/broadcast رسالتك هنا\n\n"
-                "سيتم إرسالها للمستخدمين "
-                "الذين بدأوا البوت.",
-                reply_markup=admin_keyboard(),
-            )
-
-
-async def unknown(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.effective_message.reply_text(
-        "لم أفهم الأمر 🤔\n"
-        "اكتب /help لرؤية الأوامر."
-    )
-
-
-async def setup_commands(
-    application: Application,
-):
-    await application.bot.set_my_commands([
-        BotCommand("start", "القائمة الرئيسية"),
-        BotCommand("help", "المساعدة والأوامر"),
-        BotCommand("info", "معلومات البوت"),
-        BotCommand("suggest", "إرسال اقتراح"),
-        BotCommand("ask", "سؤال المساعد"),
-        BotCommand("admin", "لوحة المطوّر"),
-    ])
-
-
-def main():
-    if not TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN is missing"
-        )
-
-    if not RENDER_URL:
-        raise RuntimeError(
-            "RENDER_EXTERNAL_URL is missing"
-        )
-
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .post_init(setup_commands)
-        .build()
-    )
-
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-    app.add_handler(
-        CommandHandler("help", help_command)
-    )
-    app.add_handler(
-        CommandHandler("info", info)
-    )
-    app.add_handler(
-        CommandHandler("suggest", suggest)
-    )
-    app.add_handler(
-        CommandHandler("ask", ask)
-    )
-    app.add_handler(
-        CommandHandler("admin", admin)
-    )
-    app.add_handler(
-        CommandHandler("stats", stats)
-    )
-    app.add_handler(
-        CommandHandler("broadcast", broadcast)
-    )
-    app.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
-    app.add_handler(
-        MessageHandler(filters.COMMAND, unknown)
-    )
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TOKEN,
-        webhook_url=f"{RENDER_URL}/{TOKEN}",
-    )
-
-
-if __name__ == "__main__":
-    main()
-import os
-import logging
-import sqlite3
-from datetime import datetime, timezone
-
-from telegram import (
-    Update,
-    BotCommand,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-PORT = int(os.environ.get("PORT", "10000"))
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
-DB_PATH = os.environ.get("DB_PATH", "bot_data.sqlite3")
-
-TELEGRAM_LINK = "https://t.me/alsvdbdbdhdhdjhfh"
-INSTAGRAM_LINK = "https://www.instagram.com/2a3ka?hvrq=dDZhdjFsajJ1NHV6"
-WEBSITE_LINK = "https://astounding-seahorse-021ea5.netlify.app/"
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger(__name__)
-
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            joined_at TEXT
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS suggestions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message TEXT,
-            created_at TEXT
-        )
-    """)
-
-    return conn
-
-
-def save_user(user):
-    if not user:
         return
 
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO users
-            (user_id, username, first_name, joined_at)
-            VALUES (
-                ?, ?, ?,
-                COALESCE(
-                    (SELECT joined_at FROM users WHERE user_id=?),
-                    ?
-                )
-            )
-            """,
-            (
-                user.id,
-                user.username or "",
-                user.first_name or "",
-                user.id,
-                datetime.now(timezone.utc).isoformat(),
+    if len(prompt) > 8000:
+        await update.effective_message.reply_text(
+            "السؤال طويل جدًا. أرسل سؤالًا أقصر."
+        )
+        return
+
+    status = await update.effective_message.reply_text(
+        "🧠 لحظة، أفكر في إجابتك..."
+    )
+
+    try:
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+        history = get_history(user.id)
+
+        conversation = history + [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ]
+
+        response = await client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=(
+                "أنت مساعد ذكي داخل بوت تيليغرام. "
+                "أجب باللغة العربية الواضحة والودودة. "
+                "استخدم اللهجة العربية البسيطة عند الحاجة. "
+                "ساعد في البرمجة والتقنية والأسئلة العامة. "
+                "إذا لم تكن متأكدًا من معلومة، وضح ذلك. "
+                "لا تدّع أنك نفذت إجراءً خارج المحادثة."
             ),
+            input=conversation,
+        )
+
+        answer = (response.output_text or "").strip()
+
+        if not answer:
+            answer = "لم أتمكن من إنشاء إجابة. حاول مرة أخرى."
+
+        history.append({"role": "user", "content": prompt})
+        history.append({"role": "assistant", "content": answer})
+        save_history(user.id, history)
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        # تيليغرام يسمح برسالة نصية حتى 4096 حرفًا تقريبًا
+        for i in range(0, len(answer), 4000):
+            await update.effective_message.reply_text(
+                answer[i:i + 4000]
+            )
+
+    except Exception:
+        logger.exception("OpenAI request failed")
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        await update.effective_message.reply_text(
+            "❌ حدث خطأ أثناء الاتصال بالذكاء الاصطناعي.\n\n"
+            "تأكد من:\n"
+            "1. صحة مفتاح OpenAI.\n"
+            "2. وجود رصيد API.\n"
+            "3. صحة اسم النموذج في OPENAI_MODEL.\n"
+            "4. نجاح تشغيل البوت على Render."
         )
 
 
-def user_count():
-    with db() as conn:
-        return conn.execute(
+# =========================================================
+# مسح ذاكرة المحادثة
+# =========================================================
+
+async def reset_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+    clear_history(user.id)
+
+    await update.effective_message.reply_text(
+        "🧹 تم مسح ذاكرة محادثتك مع الذكاء الاصطناعي."
+    )
+
+
+# =========================================================
+# لوحة الإدارة
+# =========================================================
+
+def is_admin(user_id):
+    if not ADMIN_ID:
+        return False
+
+    try:
+        return int(ADMIN_ID) == int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+
+async def admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+
+    if not is_admin(user.id):
+        await update.effective_message.reply_text(
+            "⛔ هذا الأمر مخصص للإدارة."
+        )
+        return
+
+    text = (
+        "👑 لوحة الإدارة\n\n"
+        "الأوامر المتاحة:\n"
+        "/stats - إحصائيات البوت\n"
+        "/broadcast رسالتك - إرسال رسالة للجميع"
+    )
+
+    await update.effective_message.reply_text(text)
+
+
+# =========================================================
+# إحصائيات البوت
+# =========================================================
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+
+    if not is_admin(user.id):
+        await update.effective_message.reply_text(
+            "⛔ هذا الأمر مخصص للإدارة."
+        )
+        return
+
+    with get_db() as db:
+        users_count = db.execute(
             "SELECT COUNT(*) FROM users"
         ).fetchone()[0]
 
+        suggestions_count = db.execute(
+            "SELECT COUNT(*) FROM suggestions"
+        ).fetchone()[0]
 
-def home_keyboard():
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "⚡ مركز الأوامر",
-                callback_data="commands",
-            ),
-            InlineKeyboardButton(
-                "👨‍💻 المطوّر",
-                callback_data="developer",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📢 تيليغرام",
-                url=TELEGRAM_LINK,
-            ),
-            InlineKeyboardButton(
-                "📸 إنستغرام",
-                url=INSTAGRAM_LINK,
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🌐 موقع المطوّر",
-                url=WEBSITE_LINK,
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "💡 اقتراح أو مشكلة",
-                callback_data="suggest",
-            ),
-        ],
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-def admin_keyboard():
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📊 الإحصائيات",
-                callback_data="admin_stats",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📣 طريقة الإذاعة",
-                callback_data="admin_broadcast",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🏠 الرئيسية",
-                callback_data="home",
-            ),
-        ],
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-def is_admin(user):
-    return bool(
-        user
-        and ADMIN_ID
-        and user.id == ADMIN_ID
+    text = (
+        "📊 إحصائيات البوت\n\n"
+        f"👥 عدد المستخدمين: {users_count}\n"
+        f"💡 عدد الاقتراحات: {suggestions_count}"
     )
 
+    await update.effective_message.reply_text(text)
 
-async def start(
+
+# =========================================================
+# بث رسالة لجميع المستخدمين
+# =========================================================
+
+async def broadcast_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    save_user(update.effective_user)
+    user = update.effective_user
 
-    await update.effective_message.reply_text(
-        "✨ أهلاً بك في مركز المطوّر الرقمي!\n\n"
-        "أنا بوت شخصي قيد التطوير.\n"
-        "اختر ما تريد من القائمة:",
-        reply_markup=home_keyboard(),
-    )
-
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    save_user(update.effective_user)
-
-    await update.effective_message.reply_text(
-        "📋 أوامر البوت:\n\n"
-        "/start — القائمة الرئيسية\n"
-        "/help — المساعدة\n"
-        "/info — معلومات البوت\n"
-        "/suggest — إرسال اقتراح\n"
-        "/ask — سؤال المساعد\n\n"
-        "أوامر الإدارة:\n"
-        "/admin — لوحة المطوّر\n"
-        "/stats — إحصائيات البوت\n"
-        "/broadcast — إرسال رسالة جماعية",
-        reply_markup=home_keyboard(),
-    )
-
-
-async def info(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    save_user(update.effective_user)
-
-    await update.effective_message.reply_text(
-        "🤖 ALI • DIGITAL CORE\n\n"
-        "بوت شخصي لاستقبال الأوامر "
-        "وتقديم أدوات مفيدة.\n"
-        "يتم تطويره باستمرار.",
-        reply_markup=home_keyboard(),
-    )
-
-
-async def developer(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.effective_message.reply_text(
-        "👨‍💻 معلومات المطوّر\n\n"
-        "شاب سوري شغوف بالبرمجة "
-        "ويسعى لإتقانها. 🇸🇾\n\n"
-        "التعلّم مستمر والطموح لا يتوقف.",
-        reply_markup=home_keyboard(),
-    )
-
-
-async def suggest(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    save_user(update.effective_user)
-
-    message = " ".join(context.args).strip()
-
-    if not message:
+    if not is_admin(user.id):
         await update.effective_message.reply_text(
-            "اكتب اقتراحك بهذا الشكل:\n"
-            "/suggest أضيفوا ميزة جديدة"
-        )
-        return
-
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO suggestions
-            (user_id, message, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (
-                update.effective_user.id,
-                message,
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-
-    if ADMIN_ID:
-        user = update.effective_user
-
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"💡 اقتراح جديد\n"
-                f"الاسم: {user.full_name}\n"
-                f"المعرف: {user.id}\n\n"
-                f"{message}",
-            )
-        except Exception:
-            log.exception(
-                "Could not notify admin"
-            )
-
-    await update.effective_message.reply_text(
-        "وصل اقتراحك، شكرًا لمساهمتك 💛"
-    )
-
-
-async def admin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user):
-        await update.effective_message.reply_text(
-            "هذا الأمر مخصص للمطوّر فقط 🔒"
-        )
-        return
-
-    await update.effective_message.reply_text(
-        "🛡️ لوحة تحكم المطوّر\n"
-        "اختر إحدى الأدوات:",
-        reply_markup=admin_keyboard(),
-    )
-
-
-async def stats(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user):
-        await update.effective_message.reply_text(
-            "غير مصرح لك 🔒"
-        )
-        return
-
-    await update.effective_message.reply_text(
-        f"📊 إحصائيات البوت\n\n"
-        f"👥 المستخدمون المسجلون: {user_count()}"
-    )
-
-
-async def broadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user):
-        await update.effective_message.reply_text(
-            "غير مصرح لك 🔒"
+            "⛔ هذا الأمر مخصص للإدارة."
         )
         return
 
@@ -859,204 +531,208 @@ async def broadcast(
 
     if not message:
         await update.effective_message.reply_text(
-            "استخدم الأمر هكذا:\n"
-            "/broadcast رسالتك لجميع المستخدمين"
+            "استخدم الأمر بهذا الشكل:\n"
+            "/broadcast مرحبًا بكم في البوت"
         )
         return
 
-    with db() as conn:
-        ids = [
-            row[0]
-            for row in conn.execute(
-                "SELECT user_id FROM users"
-            ).fetchall()
-        ]
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT user_id FROM users"
+        ).fetchall()
 
-    sent = 0
+    success = 0
     failed = 0
 
-    status = await update.effective_message.reply_text(
-        "⏳ جارٍ إرسال الرسالة..."
+    await update.effective_message.reply_text(
+        f"📢 بدأ إرسال الرسالة إلى {len(rows)} مستخدم."
     )
 
-    for user_id in ids:
+    for row in rows:
+        user_id = row[0]
+
         try:
             await context.bot.send_message(
-                user_id,
-                message,
+                chat_id=user_id,
+                text=message,
             )
-            sent += 1
+            success += 1
 
         except Exception:
             failed += 1
-
-    await status.edit_text(
-        f"✅ انتهى الإرسال\n"
-        f"وصلت: {sent}\n"
-        f"تعذّر: {failed}"
-    )
-
-
-async def ask(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    save_user(update.effective_user)
-
-    prompt = " ".join(context.args).strip()
-
-    if not prompt:
-        await update.effective_message.reply_text(
-            "اكتب سؤالك بعد الأمر /ask"
-        )
-        return
+            logger.warning("Broadcast failed for user %s", user_id)
 
     await update.effective_message.reply_text(
-        "🧠 ميزة الذكاء الاصطناعي "
-        "غير مربوطة حاليًا.\n\n"
-        "سيتم تفعيلها عند إضافة "
-        "خدمة الذكاء الاصطناعي."
+        "✅ انتهى البث.\n\n"
+        f"تم الإرسال: {success}\n"
+        f"فشل الإرسال: {failed}"
     )
 
+
+# =========================================================
+# أزرار القائمة
+# =========================================================
 
 async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
-
     await query.answer()
 
-    data = query.data
+    user = query.from_user
+    save_user(user)
 
-    if data == "home":
+    if query.data == "ask":
         await query.message.reply_text(
-            "🏠 القائمة الرئيسية:",
-            reply_markup=home_keyboard(),
+            "🤖 اكتب سؤالك بهذا الشكل:\n\n"
+            "/ask كيف أتعلم البرمجة؟"
         )
 
-    elif data == "commands":
+    elif query.data == "developer":
         await query.message.reply_text(
-            "⚡ مركز الأوامر\n\n"
-            "/start — الرئيسية\n"
-            "/help — المساعدة\n"
-            "/info — معلومات البوت\n"
-            "/suggest — إرسال اقتراح\n"
-            "/ask — سؤال المساعد",
-            reply_markup=home_keyboard(),
+            f"👨‍💻 {DEVELOPER_BIO}\n\n"
+            "روابط المطور:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "📱 تيليغرام",
+                    url=TELEGRAM_LINK,
+                )],
+                [InlineKeyboardButton(
+                    "📸 إنستغرام",
+                    url=INSTAGRAM_LINK,
+                )],
+                [InlineKeyboardButton(
+                    "🌐 الموقع",
+                    url=WEBSITE_LINK,
+                )],
+            ]),
         )
 
-    elif data == "developer":
-        await developer(update, context)
-
-    elif data == "suggest":
+    elif query.data == "info":
         await query.message.reply_text(
-            "💡 لإرسال اقتراح أو مشكلة:\n"
-            "/suggest ثم اكتب رسالتك"
+            "📊 بوت مساعد ذكي باللغة العربية.\n"
+            "يعمل باستخدام OpenAI وTelegram."
         )
 
-    elif data.startswith("admin_"):
-        if not is_admin(query.from_user):
-            await query.message.reply_text(
-                "هذا القسم للمطوّر فقط 🔒"
-            )
-            return
-
-        if data == "admin_stats":
-            await query.message.reply_text(
-                f"📊 المستخدمون المسجلون: "
-                f"{user_count()}",
-                reply_markup=admin_keyboard(),
-            )
-
-        elif data == "admin_broadcast":
-            await query.message.reply_text(
-                "📣 للإذاعة اكتب:\n"
-                "/broadcast رسالتك هنا\n\n"
-                "سيتم إرسالها للمستخدمين "
-                "الذين بدأوا البوت.",
-                reply_markup=admin_keyboard(),
-            )
+    elif query.data == "suggest":
+        await query.message.reply_text(
+            "💡 أرسل اقتراحك بهذا الشكل:\n\n"
+            "/suggest أريد إضافة ميزة جديدة"
+        )
 
 
-async def unknown(
+# =========================================================
+# استقبال الرسائل العادية
+# =========================================================
+
+async def text_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    user = update.effective_user
+    save_user(user)
+
     await update.effective_message.reply_text(
-        "لم أفهم الأمر 🤔\n"
-        "اكتب /help لرؤية الأوامر."
+        "وصلت رسالتك 👋\n\n"
+        "للتحدث مع الذكاء الاصطناعي، استخدم:\n"
+        "/ask ثم اكتب سؤالك.\n\n"
+        "مثال:\n"
+        "/ask اشرح لي بايثون"
     )
 
 
-async def setup_commands(
-    application: Application,
-):
+# =========================================================
+# إعداد أوامر البوت
+# =========================================================
+
+async def post_init(application: Application):
     await application.bot.set_my_commands([
-        BotCommand("start", "القائمة الرئيسية"),
-        BotCommand("help", "المساعدة والأوامر"),
+        BotCommand("start", "تشغيل البوت"),
+        BotCommand("help", "المساعدة"),
         BotCommand("info", "معلومات البوت"),
+        BotCommand("ask", "اسأل الذكاء الاصطناعي"),
+        BotCommand("reset", "مسح ذاكرة المحادثة"),
         BotCommand("suggest", "إرسال اقتراح"),
-        BotCommand("ask", "سؤال المساعد"),
-        BotCommand("admin", "لوحة المطوّر"),
+        BotCommand("admin", "لوحة الإدارة"),
+        BotCommand("stats", "الإحصائيات"),
     ])
 
 
+# =========================================================
+# تشغيل البوت على Render
+# =========================================================
+
 def main():
-    if not TOKEN:
+    if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN is missing"
+            "BOT_TOKEN غير موجود في Environment Variables"
         )
 
-    if not RENDER_URL:
-        raise RuntimeError(
-            "RENDER_EXTERNAL_URL is missing"
-        )
+    init_db()
 
-    app = (
+    application = (
         Application.builder()
-        .token(TOKEN)
-        .post_init(setup_commands)
+        .token(BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-    app.add_handler(
-        CommandHandler("help", help_command)
-    )
-    app.add_handler(
-        CommandHandler("info", info)
-    )
-    app.add_handler(
-        CommandHandler("suggest", suggest)
-    )
-    app.add_handler(
-        CommandHandler("ask", ask)
-    )
-    app.add_handler(
-        CommandHandler("admin", admin)
-    )
-    app.add_handler(
-        CommandHandler("stats", stats)
-    )
-    app.add_handler(
-        CommandHandler("broadcast", broadcast)
-    )
-    app.add_handler(
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("info", info_command))
+    application.add_handler(CommandHandler("ask", ask_command))
+    application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(CommandHandler("suggest", suggest_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
+
+    application.add_handler(
         CallbackQueryHandler(button_handler)
     )
-    app.add_handler(
-        MessageHandler(filters.COMMAND, unknown)
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler,
+        )
     )
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TOKEN,
-        webhook_url=f"{RENDER_URL}/{TOKEN}",
-    )
+    external_url = os.environ.get(
+        "RENDER_EXTERNAL_URL", ""
+    ).strip().rstrip("/")
+
+    port = int(os.environ.get("PORT", "10000"))
+
+    if external_url:
+        # إنشاء مسار Webhook آمن دون كشف توكن البوت
+        webhook_path = hashlib.sha256(
+            BOT_TOKEN.encode()
+        ).hexdigest()[:32]
+
+        webhook_secret = hashlib.sha256(
+            (BOT_TOKEN + "telegram-webhook").encode()
+        ).hexdigest()[:32]
+
+        webhook_url = (
+            f"{external_url}/{webhook_path}"
+        )
+
+        logger.info("Starting Telegram webhook")
+
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=webhook_url,
+            secret_token=webhook_secret,
+            bootstrap_retries=-1,
+        )
+
+    else:
+        logger.info("Starting Telegram polling")
+        application.run_polling()
 
 
 if __name__ == "__main__":
