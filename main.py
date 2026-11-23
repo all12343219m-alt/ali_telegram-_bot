@@ -180,7 +180,7 @@ def download_generated_image(prompt: str) -> bytes:
     )
     request = Request(
         url,
-        data=json.dumps({"prompt": prompt, "steps": 4}).encode("utf-8"),
+        data=json.dumps({"prompt": prompt, "steps": 8}).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {CF_API_TOKEN}",
             "Content-Type": "application/json",
@@ -194,6 +194,32 @@ def download_generated_image(prompt: str) -> bytes:
     if not image_b64:
         raise RuntimeError("لم تُرجع الخدمة صورة.")
     return base64.b64decode(image_b64)
+
+async def translate_prompt(prompt: str) -> str:
+    """يترجم الوصف للإنجليزية ويحسّنه لتوليد الصور."""
+    if not ai_client:
+        return prompt
+    try:
+        response = await ai_client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate the user's image description into a detailed "
+                        "English prompt for an image generator. Output only the "
+                        "English prompt, nothing else."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=200,
+        )
+        return (response.choices[0].message.content or prompt).strip()
+    except Exception:
+        logger.exception("Translate failed")
+        return prompt
 
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -224,7 +250,8 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        image_bytes = await asyncio.to_thread(download_generated_image, prompt)
+        english_prompt = await translate_prompt(prompt)
+        image_bytes = await asyncio.to_thread(download_generated_image, english_prompt)
         photo = io.BytesIO(image_bytes)
         photo.name = "generated_image.jpg"
         await update.message.reply_photo(
