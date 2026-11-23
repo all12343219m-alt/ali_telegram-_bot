@@ -1,10 +1,11 @@
 import os
+import json
+import base64
 import logging
 import sqlite3
 import asyncio
 import io
 from datetime import datetime
-from urllib.parse import quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -24,8 +25,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
-POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY", "")
-POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux")
+# Cloudflare Workers AI (توليد الصور)
+CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
+CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
@@ -56,21 +58,42 @@ def get_db():
 
 def init_db():
     with get_db() as db:
-        db.execute(""" CREATE TABLE IF NOT EXISTS users ( user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, joined_at TEXT ) """)
-        db.execute(""" CREATE TABLE IF NOT EXISTS suggestions ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, message TEXT, created_at TEXT ) """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                joined_at TEXT
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                message TEXT,
+                created_at TEXT
+            )
+        """)
 
 def save_user(user):
     if not user:
         return
     with get_db() as db:
-        db.execute(""" INSERT OR REPLACE INTO users (user_id, username, first_name, joined_at) VALUES (?, ?, ?, COALESCE( (SELECT joined_at FROM users WHERE user_id = ?), ? )) """, (
+        db.execute("""
+            INSERT OR REPLACE INTO users (user_id, username, first_name, joined_at)
+            VALUES (?, ?, ?, COALESCE((SELECT joined_at FROM users WHERE user_id = ?), ?))
+        """, (
             user.id, user.username or "", user.first_name or "",
             user.id, datetime.now().isoformat(),
         ))
 
 def save_suggestion(user, message):
     with get_db() as db:
-        db.execute(""" INSERT INTO suggestions (user_id, username, message, created_at) VALUES (?, ?, ?, ?) """, (
+        db.execute("""
+            INSERT INTO suggestions (user_id, username, message, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (
             user.id, user.username or "", message,
             datetime.now().isoformat(),
         ))
@@ -147,32 +170,30 @@ async def ask_ai(user_id, question):
         return "❌ حدث خطأ أثناء الاتصال بالذكاء الاصطناعي. حاول مرة أخرى بعد قليل."
 
 # =========================
-# توليد الصور - Pollinations
+# توليد الصور - Cloudflare Workers AI
 # =========================
 def download_generated_image(prompt: str) -> bytes:
-    """يجلب الصورة من Pollinations داخل خادم البوت باستخدام المفتاح السري."""
-    prompt_encoded = quote(prompt, safe="")
-    model_encoded = quote(POLLINATIONS_IMAGE_MODEL, safe="")
+    """يولّد الصورة عبر Cloudflare Workers AI (FLUX.1-schnell)."""
     url = (
-        f"https://gen.pollinations.ai/image/{prompt_encoded}"
-        f"?model={model_encoded}&width=1024&height=1024"
+        f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
+        "/ai/run/@cf/black-forest-labs/flux-1-schnell"
     )
     request = Request(
         url,
+        data=json.dumps({"prompt": prompt, "steps": 4}).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
+            "Authorization": f"Bearer {CF_API_TOKEN}",
+            "Content-Type": "application/json",
             "User-Agent": "AliTelegramBot/1.0",
         },
-        method="GET",
+        method="POST",
     )
-    with urlopen(request, timeout=180) as response:
-        content_type = response.headers.get("Content-Type", "")
-        data = response.read()
-        if not content_type.startswith("image/"):
-            raise RuntimeError("API لم يُرجع ملف صورة.")
-        if not data:
-            raise RuntimeError("الصورة التي أعادها API فارغة.")
-        return data
+    with urlopen(request, timeout=120) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    image_b64 = (result.get("result") or {}).get("image")
+    if not image_b64:
+        raise RuntimeError("لم تُرجع الخدمة صورة.")
+    return base64.b64decode(image_b64)
 
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -186,10 +207,10 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if not POLLINATIONS_API_KEY:
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         await update.message.reply_text(
-            "❌ مفتاح توليد الصور غير مضبوط.\n"
-            "أضف POLLINATIONS_API_KEY في Render Environment."
+            "❌ إعدادات توليد الصور غير مضبوطة.\n"
+            "أضف CF_ACCOUNT_ID و CF_API_TOKEN في Render Environment."
         )
         return
 
@@ -213,26 +234,24 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.delete()
 
     except HTTPError as error:
-        logger.warning("Pollinations HTTP error: %s", error.code)
-        if error.code == 401:
-            message = "🔑 مفتاح Pollinations غير صحيح أو غير مخوّل."
-        elif error.code == 402:
-            message = "💳 رصيد/ميزانية Pollinations غير كافٍ. تحقق من رصيد حسابك."
+        logger.warning("Cloudflare HTTP error: %s", error.code)
+        if error.code in (401, 403):
+            message = "🔑 التوكن أو Account ID غير صحيح. تحقق منهما في Render."
         elif error.code == 429:
-            message = "⏳ الطلبات كثيرة حاليًا. انتظر قليلًا ثم جرّب."
+            message = "⏳ نفدت الحصة اليومية أو الطلبات كثيرة. انتظر ثم جرّب."
         else:
             message = f"❌ خدمة الصور أعادت خطأ HTTP {error.code}. حاول لاحقًا."
         await status.edit_text(message)
 
     except (URLError, TimeoutError) as error:
-        logger.warning("Pollinations connection/timeout: %s", error)
+        logger.warning("Cloudflare connection/timeout: %s", error)
         await status.edit_text("🌐 تعذّر الاتصال بخدمة الصور أو انتهت مهلة الطلب. حاول مجددًا.")
 
     except Exception:
         logger.exception("Image generation failed")
         await status.edit_text(
             "❌ لم أتمكن من توليد الصورة هذه المرة.\n"
-            "قد يكون النموذج مشغولًا أو أن إعدادات المفتاح/الرصيد تحتاج إلى مراجعة."
+            "تحقق من إعدادات CF_ACCOUNT_ID و CF_API_TOKEN."
         )
 
 # =========================
@@ -419,7 +438,12 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN غير موجود في Environment")
     init_db()
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
