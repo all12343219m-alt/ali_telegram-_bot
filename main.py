@@ -1,1074 +1,675 @@
-import os
-import re
-import io
-import json
-import time
-import base64
-import random
-import logging
-import sqlite3
 import asyncio
-from contextlib import contextmanager
-from datetime import datetime
-from urllib.parse import quote
+import html
+import logging
+import os
+import time
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
 
-from openai import AsyncOpenAI
+import asyncpg
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    BotCommand, BotCommandScopeChat, MenuButtonCommands,
+    BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup,
+    MenuButtonCommands, Update,
 )
-from telegram.constants import ChatAction
+from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters,
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    Defaults, MessageHandler, filters,
 )
 
 # =========================
-# إعدادات البوت
+# الإعدادات (من Render → Environment)
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+_admin_raw = os.getenv("ADMIN_ID", "") or os.getenv("ADMIN_IDS", "")
+ADMINS = {int(x) for x in _admin_raw.replace(" ", "").split(",") if x.isdigit()}
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-# نموذج تحليل الصور (يجب أن يدعم الصور). غيّره من Render إن لم يعمل.
-OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "openrouter/free")
-
-# Cloudflare Workers AI (توليد الصور + تحويل الصوت لنص)
-CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
-CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
-CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
-CF_STT_MODEL = os.getenv("CF_STT_MODEL", "@cf/openai/whisper-large-v3-turbo")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+STORE_NAME = os.getenv("STORE_NAME", "متجر النخبة")
+SHAM_ADDRESS = os.getenv("SHAMCASH_ADDRESS", "ضع_عنوان_شام_كاش_هنا")
+SHAM_NAME = os.getenv("SHAMCASH_NAME", "اسم صاحب الحساب")
+CUR = os.getenv("CURRENCY", "$")
+MIN_TOPUP = float(os.getenv("MIN_TOPUP", "1"))
+SUPPORT = os.getenv("SUPPORT_USERNAME", "").lstrip("@")
+TELEGRAM_LINK = os.getenv("TELEGRAM_LINK", "https://t.me/alsvdbdbdhdhdjhfh")
+INSTAGRAM_LINK = os.getenv("INSTAGRAM_LINK", "https://www.instagram.com/2a3ka?hvrq=dDZhdjFsajJ1NHV6")
 
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
-DB_FILE = "bot_data.db"
 
-TELEGRAM_LINK = "https://t.me/alsvdbdbdhdhdjhfh"
-INSTAGRAM_LINK = "https://www.instagram.com/2a3ka?hvrq=dDZhdjFsajJ1NHV6"
-WEBSITE_LINK = "https://astounding-seahorse-021ea5.netlify.app"
-
-DEVELOPER_INFO = (
-    "👨‍💻 معلومات المطوّر\n\n"
-    "شاب سوري شغوف بالبرمجة ويسعى لإتقانها.\n\n"
-    "صنع هذا البوت بكل شغف، ويطمح دائمًا لتطوير أفكار جديدة ومميزة."
-)
-
-IMAGE_COOLDOWN = 15  # ثواني بين كل صورة وأخرى لنفس المستخدم
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# =========================
-# قاعدة البيانات
-# =========================
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-def init_db():
-    with get_db() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                joined_at TEXT
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS suggestions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                message TEXT,
-                created_at TEXT
-            )
-        """)
-
-def save_user(user):
-    if not user:
-        return
-    with get_db() as db:
-        db.execute("""
-            INSERT OR REPLACE INTO users (user_id, username, first_name, joined_at)
-            VALUES (?, ?, ?, COALESCE((SELECT joined_at FROM users WHERE user_id = ?), ?))
-        """, (
-            user.id, user.username or "", user.first_name or "",
-            user.id, datetime.now().isoformat(),
-        ))
-
-def save_suggestion(user, message):
-    with get_db() as db:
-        db.execute("""
-            INSERT INTO suggestions (user_id, username, message, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (user.id, user.username or "", message, datetime.now().isoformat()))
-
-def get_all_users():
-    with get_db() as db:
-        rows = db.execute("SELECT user_id FROM users").fetchall()
-    return [row[0] for row in rows]
-
-def get_user_count():
-    with get_db() as db:
-        return db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-
-def get_suggestion_count():
-    with get_db() as db:
-        return db.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0]
-
-# =========================
-# أدوات مساعدة عامة
-# =========================
-def http_get(url: str, timeout: int = 30):
-    request = Request(url, headers={"User-Agent": "AliTelegramBot/1.0"})
-    with urlopen(request, timeout=timeout) as response:
-        return response.read(), response.headers.get("Content-Type", "")
-
-def cf_configured() -> bool:
-    return bool(CF_ACCOUNT_ID and CF_API_TOKEN)
-
-def cf_run(model: str, payload: dict, timeout: int = 120) -> dict:
-    """استدعاء نموذج على Cloudflare Workers AI."""
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model}"
-    request = Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {CF_API_TOKEN}",
-            "Content-Type": "application/json",
-            "User-Agent": "AliTelegramBot/1.0",
-        },
-        method="POST",
-    )
-    with urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-async def reply_long(message, text: str, first=None):
-    """يقسّم النص الطويل. إن مُرّرت first يُعدَّل بها أول جزء."""
-    text = text or "..."
-    parts = [text[i:i + 4000] for i in range(0, len(text), 4000)]
-    for index, part in enumerate(parts):
-        if index == 0 and first is not None:
-            await first.edit_text(part)
-        else:
-            await message.reply_text(part)
-
-def get_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """النص من الأمر، أو من الرسالة التي تم الرد عليها."""
-    text = " ".join(context.args).strip()
-    if not text and update.message.reply_to_message:
-        reply = update.message.reply_to_message
-        text = (reply.text or reply.caption or "").strip()
-    return text
-
-def has_arabic(text: str) -> bool:
-    return bool(re.search(r"[\u0600-\u06FF]", text))
-
-# =========================
-# الذكاء الاصطناعي - OpenRouter
-# =========================
-ai_client = None
-if OPENROUTER_API_KEY:
-    ai_client = AsyncOpenAI(
-        api_key=OPENROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1",
-        timeout=90,
-        default_headers={
-            "HTTP-Referer": WEBSITE_LINK,
-            "X-Title": "Ali Telegram Bot",
-        },
-    )
-
-NO_KEY_MESSAGE = "❌ مفتاح OpenRouter غير موجود. أضف OPENROUTER_API_KEY في Render."
-
-chat_history = {}
-MAX_HISTORY = 12
-
-def ai_error_message(error) -> str:
-    text = str(error).lower()
-    if "429" in text:
-        return "⚠️ وصلت إلى حد الاستخدام المجاني مؤقتًا. انتظر قليلًا ثم حاول مجددًا."
-    if "401" in text or "403" in text:
-        return "❌ مشكلة في مفتاح OpenRouter أو صلاحياته. تحقق من المفتاح في Render."
-    if "404" in text:
-        return "❌ النموذج غير متاح حاليًا. تحقق من OPENROUTER_MODEL في Render."
-    return "❌ حدث خطأ أثناء الاتصال بالذكاء الاصطناعي. حاول مرة أخرى بعد قليل."
-
-async def ask_ai(user_id, question):
-    if not ai_client:
-        return NO_KEY_MESSAGE
-    history = chat_history.get(user_id, [])
-    messages = [{
-        "role": "system",
-        "content": (
-            "أنت مساعد ذكي وودود داخل بوت تيليغرام. "
-            "أجب باللغة التي يستخدمها المستخدم، وكن واضحًا ومفيدًا ودقيقًا."
-        ),
-    }]
-    messages.extend(history)
-    messages.append({"role": "user", "content": question})
-
-    try:
-        response = await ai_client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=1500,
-        )
-        answer = response.choices[0].message.content
-        if not answer:
-            return "لم يصلني رد من النموذج. حاول مرة أخرى."
-        history.extend([
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer},
-        ])
-        chat_history[user_id] = history[-MAX_HISTORY:]
-        return answer
-    except Exception as error:
-        logger.exception("OpenRouter error")
-        return ai_error_message(error)
-
-async def ai_task(system: str, user_text: str, temperature: float = 0.4, max_tokens: int = 1200) -> str:
-    """مهمة سريعة بدون ذاكرة محادثة (ترجمة، تلخيص، نكتة...)."""
-    if not ai_client:
-        return NO_KEY_MESSAGE
-    try:
-        response = await ai_client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        answer = (response.choices[0].message.content or "").strip()
-        return answer or "لم يصلني رد من النموذج. حاول مرة أخرى."
-    except Exception as error:
-        logger.exception("ai_task error")
-        return ai_error_message(error)
-
-async def analyze_image(image_bytes: bytes, question: str) -> str:
-    if not ai_client:
-        return NO_KEY_MESSAGE
-    data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
-    try:
-        response = await ai_client.chat.completions.create(
-            model=OPENROUTER_VISION_MODEL,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": question},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }],
-            max_tokens=900,
-        )
-        answer = (response.choices[0].message.content or "").strip()
-        return answer or "لم أتمكن من تحليل الصورة. حاول مرة أخرى."
-    except Exception as error:
-        logger.exception("Vision error")
-        return (
-            ai_error_message(error)
-            + "\n\n(إذا استمرت المشكلة، غيّر OPENROUTER_VISION_MODEL في Render إلى نموذج يدعم الصور)"
-        )
-
-# =========================
-# أدوات النصوص: ترجمة / تلخيص / تصحيح
-# =========================
-LANGS = {
-    "ar": "Arabic", "en": "English", "fr": "French", "de": "German",
-    "es": "Spanish", "tr": "Turkish", "ru": "Russian", "it": "Italian",
-}
-
-async def run_text_tool(kind: str, text: str, target: str = "") -> str:
-    if kind == "summarize":
-        system = (
-            "Summarize the following text concisely, in the same language as the text. "
-            "Use short bullet points when helpful. Output only the summary."
-        )
-    elif kind == "fix":
-        system = (
-            "Correct the spelling, grammar and punctuation of the following text. "
-            "Keep the same language and meaning. Output only the corrected text."
-        )
-    else:
-        if not target:
-            target = "English" if has_arabic(text) else "Arabic"
-        system = (
-            f"Translate the following text to {target}. "
-            "Output only the translation, nothing else."
-        )
-    return await ai_task(system, text)
-
-async def text_tool_command(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
-    save_user(update.effective_user)
-    target = ""
-    if kind == "translate" and context.args and context.args[0].lower() in LANGS:
-        target = LANGS[context.args[0].lower()]
-        context.args = context.args[1:]
-
-    text = get_text_input(update, context)
-    if not text:
-        usage = {
-            "translate": "🌐 اكتب النص بعد الأمر أو رد على رسالة:\n/translate مرحبا كيف حالك\n/translate en نص للترجمة للإنجليزية\n\nاللغات: ar en fr de es tr ru it",
-            "summarize": "📝 اكتب النص بعد الأمر أو رد على رسالة طويلة بـ:\n/summarize",
-            "fix": "✍️ اكتب النص بعد الأمر أو رد على رسالة بـ:\n/fix",
-        }[kind]
-        await update.message.reply_text(usage)
-        return
-    if len(text) > 6000:
-        await update.message.reply_text("⚠️ النص طويل جدًا. اختصره إلى أقل من 6000 حرف.")
-        return
-
-    await update.message.chat.send_action(ChatAction.TYPING)
-    result = await run_text_tool(kind, text, target)
-    await reply_long(update.message, result)
-
-async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await text_tool_command(update, context, "translate")
-
-async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await text_tool_command(update, context, "summarize")
-
-async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await text_tool_command(update, context, "fix")
-
-# =========================
-# التسلية
-# =========================
-JOKE_SYSTEM = (
-    "اكتب نكتة واحدة قصيرة ونظيفة ومضحكة باللغة العربية. "
-    "أخرج النكتة فقط بدون مقدمة."
-)
-QUOTE_SYSTEM = (
-    "اكتب حكمة واحدة قصيرة وملهمة باللغة العربية، وإن عُرف قائلها فاذكره في سطر جديد. "
-    "أخرج الحكمة فقط بدون مقدمة."
-)
-
-async def get_fun_text(kind: str) -> str:
-    if kind == "joke":
-        return "😄 " + await ai_task(JOKE_SYSTEM, f"نكتة جديدة #{random.randint(1, 99999)}", temperature=1.0, max_tokens=300)
-    return "💡 " + await ai_task(QUOTE_SYSTEM, f"حكمة جديدة #{random.randint(1, 99999)}", temperature=1.0, max_tokens=300)
-
-def again_keyboard(kind: str):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 غيرها", callback_data=f"again:{kind}")]])
-
-async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await update.message.chat.send_action(ChatAction.TYPING)
-    await update.message.reply_text(await get_fun_text("joke"), reply_markup=again_keyboard("joke"))
-
-async def quote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await update.message.chat.send_action(ChatAction.TYPING)
-    await update.message.reply_text(await get_fun_text("quote"), reply_markup=again_keyboard("quote"))
-
-async def dice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await update.message.reply_dice(emoji="🎲")
-
-async def game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await update.message.reply_dice(emoji=random.choice(["🎯", "🏀", "⚽", "🎳", "🎰"]))
-
-async def coin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await update.message.reply_text(random.choice(["🪙 ملك (صورة)", "🪙 كتابة (نقش)"]))
-
-# =========================
-# الأدوات: QR / اختصار / عملات
-# =========================
-async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    text = get_text_input(update, context)
-    if not text:
-        await update.message.reply_text("📱 اكتب النص أو الرابط بعد الأمر:\n/qr https://example.com")
-        return
-    if len(text) > 900:
-        await update.message.reply_text("⚠️ النص طويل جدًا لرمز QR.")
-        return
-    await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
-    url = f"https://api.qrserver.com/v1/create-qr-code/?size=600x600&margin=10&data={quote(text, safe='')}"
-    try:
-        data, content_type = await asyncio.to_thread(http_get, url)
-        if not content_type.startswith("image/") or not data:
-            raise RuntimeError("not an image")
-        photo = io.BytesIO(data)
-        photo.name = "qr.png"
-        await update.message.reply_photo(photo=photo, caption="✅ رمز QR جاهز")
-    except Exception:
-        logger.exception("QR failed")
-        await update.message.reply_text("❌ تعذّر إنشاء رمز QR الآن. حاول لاحقًا.")
-
-async def short_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    link = get_text_input(update, context).split()[0] if get_text_input(update, context) else ""
-    if not link:
-        await update.message.reply_text("🔗 اكتب الرابط بعد الأمر:\n/short https://example.com/very/long/link")
-        return
-    if not link.lower().startswith(("http://", "https://")):
-        link = "https://" + link
-    url = f"https://is.gd/create.php?format=simple&url={quote(link, safe='')}"
-    try:
-        data, _ = await asyncio.to_thread(http_get, url)
-        result = data.decode("utf-8", errors="ignore").strip()
-        if not result.startswith("http"):
-            raise RuntimeError(result)
-        await update.message.reply_text(f"🔗 الرابط المختصر:\n{result}")
-    except HTTPError as error:
-        # is.gd يعيد خطأ 400 مع شرح عند الرابط غير الصالح
-        logger.warning("Shorten HTTP error: %s", error.code)
-        await update.message.reply_text("❌ الرابط غير صالح أو غير مسموح باختصاره.")
-    except Exception:
-        logger.exception("Shorten failed")
-        await update.message.reply_text("❌ تعذّر اختصار الرابط الآن. حاول لاحقًا.")
-
-def fetch_rate(base: str, target: str):
-    data, _ = http_get(f"https://open.er-api.com/v6/latest/{quote(base, safe='')}")
-    result = json.loads(data.decode("utf-8"))
-    if result.get("result") != "success":
-        raise RuntimeError("bad base currency")
-    return (result.get("rates") or {}).get(target)
-
-async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    usage = "💱 تحويل العملات:\n/currency 100 USD EUR\n/currency USD SAR"
-    args = context.args
-    try:
-        if len(args) == 2:
-            amount, base, target = 1.0, args[0], args[1]
-        elif len(args) == 3:
-            amount, base, target = float(args[0].replace(",", "")), args[1], args[2]
-        else:
-            await update.message.reply_text(usage)
-            return
-    except ValueError:
-        await update.message.reply_text(usage)
-        return
-
-    base, target = base.upper(), target.upper()
-    try:
-        rate = await asyncio.to_thread(fetch_rate, base, target)
-        if rate is None:
-            await update.message.reply_text("❌ رمز العملة غير معروف. استخدم رموزًا مثل USD EUR SAR TRY.")
-            return
-        await update.message.reply_text(
-            f"💱 {amount:,.2f} {base} = {amount * rate:,.2f} {target}\n"
-            f"📈 1 {base} = {rate:,.4f} {target}\n\n"
-            "الأسعار تقريبية وليست للتداول."
-        )
-    except Exception:
-        logger.exception("Currency failed")
-        await update.message.reply_text("❌ تعذّر جلب أسعار العملات الآن. تأكد من الرموز وحاول لاحقًا.")
-
-# =========================
-# توليد الصور - Cloudflare Workers AI
-# =========================
-async def translate_prompt(prompt: str) -> str:
-    """يترجم الوصف للإنجليزية ويحسّنه لتوليد الصور."""
-    if not ai_client:
-        return prompt
-    try:
-        response = await ai_client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Translate the user's image description into a detailed "
-                        "English prompt for an image generator. Output only the "
-                        "English prompt, nothing else."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=200,
-        )
-        return (response.choices[0].message.content or prompt).strip()
-    except Exception:
-        logger.exception("Translate failed")
-        return prompt
-
-def download_generated_image(prompt: str) -> bytes:
-    result = cf_run(CF_IMAGE_MODEL, {"prompt": prompt, "steps": 8}, timeout=120)
-    image_b64 = (result.get("result") or {}).get("image")
-    if not image_b64:
-        raise RuntimeError("لم تُرجع الخدمة صورة.")
-    return base64.b64decode(image_b64)
-
-def image_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 إعادة التوليد", callback_data="regen")]])
-
-async def run_image_generation(message, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-    if not cf_configured():
-        await message.reply_text(
-            "❌ إعدادات توليد الصور غير مضبوطة.\n"
-            "أضف CF_ACCOUNT_ID و CF_API_TOKEN في Render Environment."
-        )
-        return
-    if len(prompt) > 1000:
-        await message.reply_text("⚠️ الوصف طويل جدًا. اختصره إلى أقل من 1000 حرف.")
-        return
-
-    last = context.user_data.get("last_image_ts")
-    now = time.time()
-    if last is not None and now - last < IMAGE_COOLDOWN:
-        wait = int(IMAGE_COOLDOWN - (now - last)) + 1
-        await message.reply_text(f"⏳ انتظر {wait} ثانية قبل طلب صورة جديدة.")
-        return
-    context.user_data["last_image_ts"] = now
-    context.user_data["last_image_prompt"] = prompt
-
-    status = await message.reply_text(
-        "🎨 بدأت بتوليد الصورة...\n"
-        "قد يستغرق الأمر بعض الوقت، انتظر من فضلك."
-    )
-    try:
-        await message.chat.send_action(ChatAction.UPLOAD_PHOTO)
-        english_prompt = await translate_prompt(prompt)
-        image_bytes = await asyncio.to_thread(download_generated_image, english_prompt)
-        photo = io.BytesIO(image_bytes)
-        photo.name = "generated_image.jpg"
-        await message.reply_photo(
-            photo=photo,
-            caption=f"✨ {prompt[:900]}",
-            reply_markup=image_keyboard(),
-        )
-        await status.delete()
-
-    except HTTPError as error:
-        logger.warning("Cloudflare HTTP error: %s", error.code)
-        if error.code in (401, 403):
-            text = "🔑 التوكن أو Account ID غير صحيح. تحقق منهما في Render."
-        elif error.code == 429:
-            text = "⏳ نفدت الحصة اليومية أو الطلبات كثيرة. انتظر ثم جرّب."
-        else:
-            text = f"❌ خدمة الصور أعادت خطأ HTTP {error.code}. حاول لاحقًا."
-        await status.edit_text(text)
-
-    except (URLError, TimeoutError) as error:
-        logger.warning("Cloudflare connection/timeout: %s", error)
-        await status.edit_text("🌐 تعذّر الاتصال بخدمة الصور أو انتهت مهلة الطلب. حاول مجددًا.")
-
-    except Exception:
-        logger.exception("Image generation failed")
-        await status.edit_text(
-            "❌ لم أتمكن من توليد الصورة هذه المرة.\n"
-            "تحقق من إعدادات CF_ACCOUNT_ID و CF_API_TOKEN."
-        )
-
-async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    prompt = " ".join(context.args).strip()
-    if not prompt:
-        await update.message.reply_text(
-            "🎨 اكتب وصف الصورة بعد الأمر:\n\n"
-            "/image قطة بيضاء على سطح القمر بأسلوب سينمائي"
-        )
-        return
-    await run_image_generation(update.message, context, prompt)
-
-# =========================
-# الصور والصوت (تحليل الصور + تحويل الصوت لنص)
-# =========================
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    save_user(update.effective_user)
-    if not ai_client:
-        await message.reply_text(NO_KEY_MESSAGE)
-        return
-    photo = message.photo[-1]
-    if photo.file_size and photo.file_size > 8 * 1024 * 1024:
-        await message.reply_text("⚠️ الصورة كبيرة جدًا. أرسل صورة أصغر.")
-        return
-
-    question = (message.caption or "").strip() or "صف هذه الصورة بالتفصيل."
-    status = await message.reply_text("🔍 جاري تحليل الصورة...")
-    try:
-        await message.chat.send_action(ChatAction.TYPING)
-        file = await photo.get_file()
-        image_bytes = bytes(await file.download_as_bytearray())
-        answer = await analyze_image(
-            image_bytes,
-            question + "\n\n(أجب باللغة العربية ما لم يطلب المستخدم غير ذلك.)",
-        )
-        await reply_long(message, answer, first=status)
-    except Exception:
-        logger.exception("Photo handler failed")
-        await status.edit_text("❌ تعذّر تحليل الصورة. حاول مرة أخرى.")
-
-def transcribe_audio(audio_bytes: bytes) -> str:
-    payload = {"audio": base64.b64encode(audio_bytes).decode("ascii")}
-    result = cf_run(CF_STT_MODEL, payload, timeout=120)
-    return ((result.get("result") or {}).get("text") or "").strip()
-
-TRANSCRIPT_HEADER = "📝 النص المستخرج:\n\n"
-
-def text_actions_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📝 لخّص", callback_data="act:summarize"),
-        InlineKeyboardButton("🌐 ترجم", callback_data="act:translate"),
-        InlineKeyboardButton("✍️ صحّح", callback_data="act:fix"),
-    ]])
-
-async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    save_user(update.effective_user)
-    media = message.voice or message.audio
-    if not media:
-        return
-    if not cf_configured():
-        await message.reply_text(
-            "❌ إعدادات تحويل الصوت غير مضبوطة.\n"
-            "أضف CF_ACCOUNT_ID و CF_API_TOKEN في Render Environment."
-        )
-        return
-    if media.duration and media.duration > 180:
-        await message.reply_text("⚠️ التسجيل طويل. أرسل تسجيلًا أقصر من 3 دقائق.")
-        return
-    if media.file_size and media.file_size > 10 * 1024 * 1024:
-        await message.reply_text("⚠️ الملف الصوتي كبير جدًا.")
-        return
-
-    status = await message.reply_text("🎧 جاري تحويل الصوت إلى نص...")
-    try:
-        await message.chat.send_action(ChatAction.TYPING)
-        file = await media.get_file()
-        audio_bytes = bytes(await file.download_as_bytearray())
-        text = await asyncio.to_thread(transcribe_audio, audio_bytes)
-        if not text:
-            await status.edit_text("لم ألتقط كلامًا واضحًا في التسجيل.")
-            return
-        await status.edit_text(
-            (TRANSCRIPT_HEADER + text)[:4000],
-            reply_markup=text_actions_keyboard(),
-        )
-    except HTTPError as error:
-        logger.warning("Whisper HTTP error: %s", error.code)
-        if error.code in (401, 403):
-            msg = "🔑 التوكن أو Account ID غير صحيح."
-        elif error.code == 429:
-            msg = "⏳ نفدت الحصة اليومية. جرّب لاحقًا."
-        else:
-            msg = f"❌ خدمة تحويل الصوت أعادت خطأ HTTP {error.code}."
-        await status.edit_text(msg)
-    except Exception:
-        logger.exception("Voice handler failed")
-        await status.edit_text("❌ تعذّر تحويل الصوت إلى نص. حاول مرة أخرى.")
-
-# =========================
-# القوائم والأزرار
-# =========================
-MENUS = {
-    "ai": (
-        "🤖 الذكاء الاصطناعي\n\n"
-        "• اكتب أي سؤال مباشرة وسأجيبك\n"
-        "• /ask سؤالك\n"
-        "• أرسل صورة (مع سؤال اختياري) وسأحلّلها\n"
-        "• /reset لمسح ذاكرة المحادثة"
-    ),
-    "image": (
-        "🎨 توليد الصور\n\n"
-        "• /image وصف الصورة\n"
-        "• أو اكتب مباشرة: ارسم قطة على القمر\n\n"
-        "يدعم العربية، وتحت كل صورة زر 🔄 لإعادة التوليد."
-    ),
-    "text": (
-        "📝 أدوات النصوص\n\n"
-        "• /translate نص — ترجمة تلقائية\n"
-        "• /translate en نص — لغة محددة (ar en fr de es tr ru it)\n"
-        "• /summarize نص — تلخيص\n"
-        "• /fix نص — تصحيح إملائي ونحوي\n\n"
-        "يمكنك الرد على أي رسالة بالأمر بدل كتابة النص.\n"
-        "🎤 أرسل تسجيلًا صوتيًا وسأحوّله إلى نص."
-    ),
-    "tools": (
-        "🛠 أدوات\n\n"
-        "• /qr نص أو رابط — رمز QR\n"
-        "• /short رابط — اختصار الرابط\n"
-        "• /currency 100 USD EUR — تحويل العملات"
-    ),
-    "fun": (
-        "🎲 تسلية\n\n"
-        "• /joke — نكتة\n"
-        "• /quote — حكمة\n"
-        "• /dice — نرد\n"
-        "• /game — لعبة عشوائية\n"
-        "• /coin — ملك أو كتابة"
-    ),
-}
-
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🤖 ذكاء اصطناعي", callback_data="menu:ai"),
-            InlineKeyboardButton("🎨 الصور", callback_data="menu:image"),
-        ],
-        [
-            InlineKeyboardButton("📝 أدوات النصوص", callback_data="menu:text"),
-            InlineKeyboardButton("🛠 أدوات", callback_data="menu:tools"),
-        ],
-        [InlineKeyboardButton("🎲 تسلية", callback_data="menu:fun")],
-        [
-            InlineKeyboardButton("📢 القناة", url=TELEGRAM_LINK),
-            InlineKeyboardButton("📸 إنستغرام", url=INSTAGRAM_LINK),
-        ],
-        [
-            InlineKeyboardButton("🌐 موقعي", url=WEBSITE_LINK),
-            InlineKeyboardButton("👨‍💻 المطوّر", callback_data="developer"),
-        ],
-    ])
-
-def back_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="menu:main")]])
-
-def admin_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 إحصائيات", callback_data="admin_stats")],
-        [InlineKeyboardButton("📣 طريقة الإذاعة", callback_data="admin_broadcast")],
-    ])
-
-def welcome_text(name: str) -> str:
-    return (
-        f"أهلًا {name} 👋\n\n"
-        "أنا بوت المطوّر علي، أجمع لك الذكاء الاصطناعي والأدوات في مكان واحد.\n\n"
-        "💬 اكتب لي أي سؤال مباشرة\n"
-        "🎨 أو اكتب: ارسم + وصف الصورة\n"
-        "🎤 أو أرسل تسجيلًا صوتيًا / 🖼 صورة\n\n"
-        "اختر من القائمة:"
-    )
-
-# =========================
-# الأوامر الأساسية
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    save_user(user)
-    await update.message.reply_text(welcome_text(user.first_name), reply_markup=main_keyboard())
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📋 أوامر البوت:\n\n"
-        "🤖 /ask سؤالك — اسأل الذكاء الاصطناعي\n"
-        "🧹 /reset — مسح ذاكرة المحادثة\n"
-        "🎨 /image وصف — توليد صورة\n\n"
-        "📝 /translate — ترجمة\n"
-        "📝 /summarize — تلخيص\n"
-        "✍️ /fix — تصحيح النص\n\n"
-        "📱 /qr — رمز QR\n"
-        "🔗 /short — اختصار رابط\n"
-        "💱 /currency — تحويل العملات\n\n"
-        "😄 /joke — نكتة\n"
-        "💡 /quote — حكمة\n"
-        "🎲 /dice — نرد\n"
-        "🎯 /game — لعبة\n"
-        "🪙 /coin — ملك أو كتابة\n\n"
-        "📩 /suggest رسالتك — اقتراح أو شكوى\n"
-        "ℹ️ /info — معلومات المطوّر\n\n"
-        "🖼 أرسل صورة لتحليلها\n"
-        "🎤 أرسل تسجيلًا صوتيًا لتحويله إلى نص"
-    )
-    if is_admin(update.effective_user.id):
-        text += "\n\n👑 أوامر الإدارة:\n/admin /stats /broadcast رسالتك"
-    await update.message.reply_text(text)
-
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(DEVELOPER_INFO, reply_markup=main_keyboard())
-
-async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    save_user(user)
-    question = " ".join(context.args).strip()
-    if not question:
-        await update.message.reply_text("اكتب سؤالك هكذا:\n/ask كيف أتعلم البرمجة؟")
-        return
-    message = await update.message.reply_text("🤖 جاري التفكير...")
-    answer = await ask_ai(user.id, question)
-    await reply_long(update.message, answer, first=message)
-
-async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_history.pop(update.effective_user.id, None)
-    await update.message.reply_text("🧹 تم مسح ذاكرة المحادثة. ابدأ من جديد!")
-
-async def suggest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    save_user(user)
-    message = " ".join(context.args).strip()
-    if not message:
-        await update.message.reply_text("أرسل اقتراحك هكذا:\n/suggest أريد إضافة ميزة جديدة")
-        return
-    save_suggestion(user, message)
-    await update.message.reply_text("✅ وصل اقتراحك بنجاح، شكرًا لك!")
-    if ADMIN_ID:
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                "📩 اقتراح جديد\n\n"
-                f"المستخدم: {user.first_name}\nID: {user.id}\n"
-                f"Username: @{user.username or 'لا يوجد'}\n\n{message}",
-            )
-        except Exception:
-            logger.exception("Could not notify admin")
-
-# =========================
-# الدردشة المباشرة (بدون أوامر)
-# =========================
-DRAW_TRIGGERS = ("ارسم", "صمم", "ولّد صورة", "ولد صورة", "توليد صورة")
-
-async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    save_user(user)
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-
-    for trigger in DRAW_TRIGGERS:
-        if text.startswith(trigger):
-            prompt = text[len(trigger):].strip()
-            if prompt:
-                await run_image_generation(update.message, context, prompt)
-            else:
-                await update.message.reply_text("🎨 اكتب وصف الصورة بعد الكلمة، مثل: ارسم قطة على القمر")
-            return
-
-    await update.message.chat.send_action(ChatAction.TYPING)
-    answer = await ask_ai(user.id, text)
-    await reply_long(update.message, answer)
-
-# =========================
-# الإدارة
-# =========================
-def is_admin(user_id):
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ هذا الأمر للمطوّر فقط.")
-        return
-    await update.message.reply_text("👑 لوحة إدارة البوت", reply_markup=admin_keyboard())
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ هذا الأمر للمطوّر فقط.")
-        return
-    await update.message.reply_text(
-        "📊 إحصائيات البوت\n\n"
-        f"👥 عدد المستخدمين: {get_user_count()}\n"
-        f"📩 عدد الاقتراحات: {get_suggestion_count()}"
-    )
-
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ هذا الأمر للمطوّر فقط.")
-        return
-    text = " ".join(context.args).strip()
-    if not text:
-        await update.message.reply_text("استخدم الأمر هكذا:\n/broadcast مرحبًا بالجميع")
-        return
-    users = get_all_users()
-    sent = failed = 0
-    status = await update.message.reply_text("📣 بدأ الإرسال...")
-    for user_id in users:
-        try:
-            await context.bot.send_message(chat_id=user_id, text=text)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
-    await status.edit_text(
-        f"✅ انتهى الإرسال\n\nتم الإرسال: {sent}\nفشل الإرسال: {failed}"
-    )
-
-# =========================
-# معالج الأزرار
-# =========================
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-
-    if data.startswith("menu:"):
-        key = data.split(":", 1)[1]
-        if key == "main":
-            text, keyboard = welcome_text(query.from_user.first_name), main_keyboard()
-        else:
-            text, keyboard = MENUS.get(key, "قريبًا..."), back_keyboard()
-        try:
-            await query.edit_message_text(text, reply_markup=keyboard)
-        except BadRequest:
-            pass
-
-    elif data == "developer":
-        await query.message.reply_text(DEVELOPER_INFO)
-
-    elif data == "regen":
-        prompt = context.user_data.get("last_image_prompt")
-        if not prompt:
-            await query.message.reply_text("ما عندي وصف سابق. استخدم /image وصف الصورة.")
-            return
-        await run_image_generation(query.message, context, prompt)
-
-    elif data.startswith("again:"):
-        kind = data.split(":", 1)[1]
-        if kind not in ("joke", "quote"):
-            return
-        await query.message.chat.send_action(ChatAction.TYPING)
-        text = await get_fun_text(kind)
-        try:
-            await query.edit_message_text(text, reply_markup=again_keyboard(kind))
-        except BadRequest:
-            pass
-
-    elif data.startswith("act:"):
-        kind = data.split(":", 1)[1]
-        text = query.message.text or ""
-        if text.startswith(TRANSCRIPT_HEADER):
-            text = text[len(TRANSCRIPT_HEADER):]
-        text = text.strip()
-        if kind not in ("summarize", "translate", "fix") or not text:
-            return
-        await query.message.chat.send_action(ChatAction.TYPING)
-        result = await run_text_tool(kind, text)
-        await reply_long(query.message, result)
-
-    elif data == "admin_stats":
-        if not is_admin(query.from_user.id):
-            await query.message.reply_text("⛔ للمطوّر فقط.")
-            return
-        await query.message.reply_text(
-            f"👥 المستخدمون: {get_user_count()}\n"
-            f"📩 الاقتراحات: {get_suggestion_count()}"
-        )
-
-    elif data == "admin_broadcast":
-        if not is_admin(query.from_user.id):
-            await query.message.reply_text("⛔ للمطوّر فقط.")
-            return
-        await query.message.reply_text("📣 أرسل الإذاعة هكذا:\n/broadcast رسالتك")
-
-# =========================
-# تسجيل المستخدمين
-# =========================
-async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user:
-        save_user(update.effective_user)
-
-# =========================
-# قائمة الأوامر الرسمية في تيليغرام
-# =========================
-USER_COMMANDS = [
-    ("start", "القائمة الرئيسية"),
-    ("help", "عرض كل الأوامر"),
-    ("ask", "اسأل الذكاء الاصطناعي"),
-    ("image", "توليد صورة من وصف"),
-    ("translate", "ترجمة نص"),
-    ("summarize", "تلخيص نص"),
-    ("fix", "تصحيح إملائي ونحوي"),
-    ("joke", "نكتة"),
-    ("quote", "حكمة"),
-    ("dice", "رمي النرد"),
-    ("game", "لعبة عشوائية"),
-    ("coin", "ملك أو كتابة"),
-    ("qr", "إنشاء رمز QR"),
-    ("short", "اختصار رابط"),
-    ("currency", "تحويل العملات"),
-    ("reset", "مسح ذاكرة المحادثة"),
-    ("suggest", "إرسال اقتراح"),
-    ("info", "معلومات المطوّر"),
+pool: asyncpg.Pool
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+  id BIGINT PRIMARY KEY, name TEXT, username TEXT,
+  balance DOUBLE PRECISION DEFAULT 0, joined BIGINT);
+CREATE TABLE IF NOT EXISTS categories(
+  id SERIAL PRIMARY KEY, name TEXT, emoji TEXT, label TEXT);
+CREATE TABLE IF NOT EXISTS products(
+  id SERIAL PRIMARY KEY, cat_id INTEGER, name TEXT,
+  price DOUBLE PRECISION, active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS orders(
+  id SERIAL PRIMARY KEY, user_id BIGINT, product_name TEXT,
+  price DOUBLE PRECISION, target TEXT, status TEXT DEFAULT 'pending', created BIGINT);
+CREATE TABLE IF NOT EXISTS deposits(
+  id SERIAL PRIMARY KEY, user_id BIGINT, amount DOUBLE PRECISION,
+  txid TEXT UNIQUE, status TEXT DEFAULT 'pending', created BIGINT);
+"""
+
+# بيانات تجريبية: عدّل الأسعار والمنتجات من أوامر الأدمن
+SEED = [
+    ("شحن الألعاب", "🎮", "معرّف اللاعب (Player ID)", [
+        ("ببجي 60 شدة", 0.99), ("ببجي 325 شدة", 4.99),
+        ("فري فاير 100 جوهرة", 0.99), ("فري فاير 530 جوهرة", 4.99)]),
+    ("نجوم تيليجرام", "⭐", "يوزر تيليجرام المستلم (مثال: @username)", [
+        ("50 نجمة", 1.2), ("100 نجمة", 2.3), ("500 نجمة", 11.0)]),
+    ("البرامج والاشتراكات", "📱", "الإيميل أو رقم الحساب", [
+        ("Netflix شهر", 4.0), ("Spotify شهر", 3.0), ("ChatGPT Plus شهر", 20.0)]),
 ]
 
-async def post_init(application: Application):
-    try:
-        await application.bot.set_my_commands([BotCommand(c, d) for c, d in USER_COMMANDS])
-        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-        if ADMIN_ID:
-            admin_commands = USER_COMMANDS + [
-                ("admin", "لوحة الإدارة"),
-                ("stats", "إحصائيات البوت"),
-                ("broadcast", "إرسال رسالة للجميع"),
-            ]
-            await application.bot.set_my_commands(
-                [BotCommand(c, d) for c, d in admin_commands],
-                scope=BotCommandScopeChat(chat_id=ADMIN_ID),
-            )
-    except Exception:
-        logger.exception("Could not set bot commands")
 
 # =========================
-# تشغيل البوت على Render
+# قاعدة البيانات (Postgres على Neon)
 # =========================
+def _q(sql: str) -> str:
+    """يحوّل ? إلى $1,$2,... (صيغة Postgres)"""
+    n, out = 0, []
+    for ch in sql:
+        if ch == "?":
+            n += 1
+            out.append(f"${n}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+RETRY = (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, ConnectionError, OSError)
+
+
+async def _retry(fn):
+    # قاعدة Neon المجانية تنام وتستيقظ، فنعيد المحاولة عند انقطاع الاتصال
+    for i in range(3):
+        try:
+            return await fn()
+        except RETRY:
+            if i == 2:
+                raise
+            await asyncio.sleep(1 + i)
+
+
+async def fetch(sql, *a, one=False):
+    rows = await _retry(lambda: pool.fetch(_q(sql), *a))
+    return (rows[0] if rows else None) if one else rows
+
+
+async def run(sql, *a) -> int:
+    st = await _retry(lambda: pool.execute(_q(sql), *a))
+    return int(st.split()[-1])
+
+
+async def insert(sql, *a) -> int:
+    return await _retry(lambda: pool.fetchval(_q(sql) + " RETURNING id", *a))
+
+
+async def create_order(uid, pname, price, target):
+    """يخصم الرصيد وينشئ الطلب معاً. يرجع رقم الطلب أو None إن لم يكفِ الرصيد."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            st = await conn.execute(
+                "UPDATE users SET balance=ROUND((balance-$1)::numeric,2) "
+                "WHERE id=$2 AND balance>=$1", price, uid)
+            if st.endswith(" 0"):
+                return None
+            return await conn.fetchval(
+                "INSERT INTO orders(user_id,product_name,price,target,created) "
+                "VALUES($1,$2,$3,$4,$5) RETURNING id",
+                uid, pname, price, target, int(time.time()))
+
+
+async def settle(table, sid, new_status, uid=None, amount=0.0) -> bool:
+    """يغيّر حالة طلب/شحن معلّق مرة واحدة فقط، ويضيف رصيداً إن لزم."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            st = await conn.execute(
+                f"UPDATE {table} SET status=$1 WHERE id=$2 AND status='pending'", new_status, sid)
+            if st.endswith(" 0"):
+                return False
+            if uid is not None:
+                await conn.execute(
+                    "UPDATE users SET balance=ROUND((balance+$1)::numeric,2) WHERE id=$2", amount, uid)
+            return True
+
+
+async def init_db():
+    global pool
+    dsn = DATABASE_URL.split("?")[0]
+    pool = await asyncpg.create_pool(
+        dsn, ssl="require", min_size=1, max_size=5,
+        statement_cache_size=0, max_inactive_connection_lifetime=20)
+    await pool.execute(SCHEMA)
+    if not await fetch("SELECT 1 FROM categories LIMIT 1", one=True):
+        for name, emoji, label, prods in SEED:
+            cid = await insert("INSERT INTO categories(name,emoji,label) VALUES(?,?,?)", name, emoji, label)
+            for pn, pr in prods:
+                await run("INSERT INTO products(cat_id,name,price) VALUES(?,?,?)", cid, pn, pr)
+
+
+# =========================
+# أدوات مساعدة
+# =========================
+def esc(s) -> str:
+    return html.escape(str(s or ""))
+
+
+def money(x) -> str:
+    return f"{float(x):.2f}{CUR}"
+
+
+def B(text, data=None, url=None):
+    return InlineKeyboardButton(text, callback_data=data, url=url)
+
+
+def is_admin(uid) -> bool:
+    return uid in ADMINS
+
+
+async def get_user(u):
+    row = await fetch("SELECT * FROM users WHERE id=?", u.id, one=True)
+    if row is None:
+        await run("INSERT INTO users(id,name,username,joined) VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING",
+                  u.id, u.full_name, u.username, int(time.time()))
+        row = await fetch("SELECT * FROM users WHERE id=?", u.id, one=True)
+    return row
+
+
+async def show(update: Update, text, markup=None):
+    q = update.callback_query
+    if q:
+        try:
+            await q.edit_message_text(text, reply_markup=markup)
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                await q.message.reply_text(text, reply_markup=markup)
+    else:
+        await update.message.reply_text(text, reply_markup=markup)
+
+
+async def append_status(q, extra: str):
+    m = q.message
+    try:
+        if m.photo:
+            await q.edit_message_caption(caption=(m.caption_html or "") + "\n\n" + extra)
+        else:
+            await q.edit_message_text((m.text_html or "") + "\n\n" + extra)
+    except Exception:
+        pass
+
+
+async def notify_user(bot, uid, text):
+    try:
+        await bot.send_message(uid, text)
+    except Exception as e:
+        logger.warning("user notify failed %s: %s", uid, e)
+
+
+async def notify_admins(bot, text, markup=None, photo=None):
+    for a in ADMINS:
+        try:
+            if photo:
+                await bot.send_photo(a, photo, caption=text, reply_markup=markup)
+            else:
+                await bot.send_message(a, text, reply_markup=markup)
+        except Exception as e:
+            logger.warning("admin notify failed %s: %s", a, e)
+
+
+async def main_menu():
+    rows = [[B(f"{c['emoji']} {c['name']}", f"cat:{c['id']}")]
+            for c in await fetch("SELECT * FROM categories ORDER BY id")]
+    rows.append([B("💰 رصيدي", "wallet"), B("➕ شحن الرصيد", "topup")])
+    rows.append([B("📜 طلباتي", "orders")])
+    links = []
+    if TELEGRAM_LINK:
+        links.append(B("📢 القناة", url=TELEGRAM_LINK))
+    if INSTAGRAM_LINK:
+        links.append(B("📸 إنستغرام", url=INSTAGRAM_LINK))
+    if SUPPORT:
+        links.append(B("🆘 الدعم", url=f"https://t.me/{SUPPORT}"))
+    if links:
+        rows.append(links)
+    return InlineKeyboardMarkup(rows)
+
+
+def back_home():
+    return InlineKeyboardMarkup([[B("🏠 القائمة الرئيسية", "home")]])
+
+
+# =========================
+# المستخدم
+# =========================
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    u = update.effective_user
+    await run(
+        "INSERT INTO users(id,name,username,joined) VALUES(?,?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, username=EXCLUDED.username",
+        u.id, u.full_name, u.username, int(time.time()))
+    row = await get_user(u)
+    text = (
+        f"✨ <b>أهلاً بك في {esc(STORE_NAME)}</b> ✨\n"
+        "━━━━━━━━━━━━━━\n"
+        "⚡ شحن فوري للألعاب ونجوم تيليجرام والاشتراكات\n"
+        "💳 الدفع عبر <b>شام كاش</b>\n"
+        "🛡 خدمة موثوقة ودعم على مدار الساعة\n"
+        "━━━━━━━━━━━━━━\n"
+        f"💰 رصيدك: <b>{money(row['balance'])}</b>\n\n"
+        "اختر القسم المطلوب 👇")
+    await show(update, text, await main_menu())
+
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("تم الإلغاء ✅", reply_markup=await main_menu())
+
+
+async def wallet(update: Update, ctx):
+    u = await get_user(update.effective_user)
+    markup = InlineKeyboardMarkup([[B("➕ شحن الرصيد", "topup")], [B("🏠 القائمة الرئيسية", "home")]])
+    await show(update, f"💰 <b>محفظتك</b>\n\n🆔 <code>{u['id']}</code>\n"
+                       f"💵 الرصيد: <b>{money(u['balance'])}</b>", markup)
+
+
+async def my_orders(update: Update, ctx):
+    rows = await fetch("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10", update.effective_user.id)
+    icon = {"pending": "⏳ قيد التنفيذ", "done": "✅ تم", "failed": "❌ مرفوض (أُعيد المبلغ)"}
+    if not rows:
+        text = "📜 لا توجد طلبات بعد."
+    else:
+        text = "📜 <b>آخر طلباتك</b>\n\n" + "\n\n".join(
+            f"#{o['id']} • {esc(o['product_name'])}\n💵 {money(o['price'])} • {icon.get(o['status'], o['status'])}"
+            for o in rows)
+    await show(update, text, back_home())
+
+
+async def open_cat(update: Update, ctx, cid: int):
+    cat = await fetch("SELECT * FROM categories WHERE id=?", cid, one=True)
+    if not cat:
+        return await show(update, "القسم غير موجود.", back_home())
+    prods = await fetch("SELECT * FROM products WHERE cat_id=? AND active=1 ORDER BY price", cid)
+    rows = [[B(f"{p['name']} — {money(p['price'])}", f"prod:{p['id']}")] for p in prods]
+    rows.append([B("🏠 القائمة الرئيسية", "home")])
+    await show(update, f"{cat['emoji']} <b>{esc(cat['name'])}</b>\n\nاختر الباقة 👇", InlineKeyboardMarkup(rows))
+
+
+async def pick_product(update: Update, ctx, pid: int):
+    p = await fetch("SELECT p.*, c.label FROM products p JOIN categories c ON c.id=p.cat_id "
+                    "WHERE p.id=? AND p.active=1", pid, one=True)
+    if not p:
+        return await show(update, "⚠️ هذه الباقة غير متاحة.", back_home())
+    u = await get_user(update.effective_user)
+    if u["balance"] < p["price"]:
+        markup = InlineKeyboardMarkup([[B("➕ شحن الرصيد", "topup")], [B("🏠 القائمة الرئيسية", "home")]])
+        return await show(update, f"⚠️ رصيدك ({money(u['balance'])}) لا يكفي.\n"
+                                  f"سعر الباقة: <b>{money(p['price'])}</b>", markup)
+    ctx.user_data.clear()
+    ctx.user_data.update(state="buy_target", pid=pid)
+    await show(update, f"📝 <b>{esc(p['name'])}</b>\n\nأرسل الآن: <b>{esc(p['label'])}</b>\n\n/cancel للإلغاء")
+
+
+async def confirm_buy(update: Update, ctx):
+    d = ctx.user_data
+    if d.get("state") != "buy_confirm" or "pid" not in d:
+        return await show(update, "⌛ انتهت الجلسة، ابدأ الطلب من جديد.", back_home())
+    pid, target = d["pid"], d["target"]
+    ctx.user_data.clear()  # يمنع الضغط المزدوج
+    p = await fetch("SELECT * FROM products WHERE id=?", pid, one=True)
+    u = update.effective_user
+    oid = await create_order(u.id, p["name"], p["price"], target)
+    if oid is None:
+        return await show(update, "⚠️ الرصيد غير كافٍ.", back_home())
+    await show(update, f"✅ تم استلام طلبك <b>#{oid}</b>\nسيتم التنفيذ خلال دقائق ⚡", back_home())
+    markup = InlineKeyboardMarkup([[B("✅ تم التنفيذ", f"od:{oid}"), B("❌ رفض + استرجاع", f"of:{oid}")]])
+    await notify_admins(
+        ctx.bot,
+        f"🛒 <b>طلب جديد #{oid}</b>\n👤 {esc(u.full_name)} (<code>{u.id}</code>)\n"
+        f"📦 {esc(p['name'])}\n🎯 <code>{esc(target)}</code>\n💵 {money(p['price'])}", markup)
+
+
+async def topup(update: Update, ctx):
+    ctx.user_data.clear()
+    ctx.user_data["state"] = "top_amount"
+    await show(update,
+               "💳 <b>شحن الرصيد عبر شام كاش</b>\n━━━━━━━━━━━━━━\n"
+               f"👤 الاسم: <b>{esc(SHAM_NAME)}</b>\n"
+               f"📮 العنوان: <code>{esc(SHAM_ADDRESS)}</code>\n━━━━━━━━━━━━━━\n"
+               "1️⃣ حوّل المبلغ إلى الحساب أعلاه\n2️⃣ أرسل هنا <b>المبلغ</b> الذي حوّلته\n"
+               "3️⃣ ثم <b>رقم العملية</b> وصورة الإشعار\n\n"
+               f"الحد الأدنى: {money(MIN_TOPUP)}\n/cancel للإلغاء")
+
+
+# =========================
+# استقبال الرسائل حسب الحالة
+# =========================
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    state = ctx.user_data.get("state")
+    text = (m.text or "").strip()
+
+    if state == "buy_target":
+        if not text:
+            return await m.reply_text("أرسل المعلومة المطلوبة كنص.")
+        p = await fetch("SELECT * FROM products WHERE id=?", ctx.user_data["pid"], one=True)
+        ctx.user_data.update(state="buy_confirm", target=text[:200])
+        markup = InlineKeyboardMarkup([[B("✅ تأكيد الشراء", "confirm"), B("❌ إلغاء", "home")]])
+        return await m.reply_text(
+            "🧾 <b>تأكيد الطلب</b>\n━━━━━━━━━━━━━━\n"
+            f"📦 {esc(p['name'])}\n🎯 {esc(text[:200])}\n💵 {money(p['price'])}\n━━━━━━━━━━━━━━",
+            reply_markup=markup)
+
+    if state == "top_amount":
+        try:
+            amt = round(float(text.replace(",", ".")), 2)
+            assert amt >= MIN_TOPUP
+        except Exception:
+            return await m.reply_text(f"أرسل مبلغاً صحيحاً (الحد الأدنى {money(MIN_TOPUP)}).")
+        ctx.user_data.update(state="top_txid", amount=amt)
+        return await m.reply_text("🔢 أرسل الآن <b>رقم العملية</b> من إشعار شام كاش:")
+
+    if state == "top_txid":
+        if len(text) < 4:
+            return await m.reply_text("رقم العملية غير صالح، أعد الإرسال.")
+        if await fetch("SELECT 1 FROM deposits WHERE txid=?", text, one=True):
+            return await m.reply_text("⚠️ رقم العملية هذا مستخدم مسبقاً.")
+        ctx.user_data.update(state="top_photo", txid=text)
+        return await m.reply_text("📸 أرسل <b>صورة إشعار التحويل</b>:")
+
+    if state == "top_photo":
+        if not m.photo:
+            return await m.reply_text("أرسل صورة الإشعار من فضلك 📸")
+        d = dict(ctx.user_data)
+        ctx.user_data.clear()
+        u = update.effective_user
+        await get_user(u)
+        try:
+            did = await insert("INSERT INTO deposits(user_id,amount,txid,created) VALUES(?,?,?,?)",
+                               u.id, d["amount"], d["txid"], int(time.time()))
+        except asyncpg.UniqueViolationError:
+            return await m.reply_text("⚠️ رقم العملية مستخدم مسبقاً.", reply_markup=back_home())
+        await m.reply_text(f"⏳ تم إرسال طلب الشحن <b>#{did}</b> للمراجعة.\nسيصلك إشعار فور الموافقة.",
+                           reply_markup=back_home())
+        markup = InlineKeyboardMarkup([[B("✅ قبول", f"dy:{did}"), B("❌ رفض", f"dn:{did}")]])
+        return await notify_admins(
+            ctx.bot,
+            f"💳 <b>طلب شحن #{did}</b>\n👤 {esc(u.full_name)} (<code>{u.id}</code>)\n"
+            f"💵 {money(d['amount'])}\n🔢 <code>{esc(d['txid'])}</code>",
+            markup, photo=m.photo[-1].file_id)
+
+    # لا توجد عملية جارية
+    if m.chat.type == "private":
+        await m.reply_text("اختر من القائمة 👇", reply_markup=await main_menu())
+
+
+# =========================
+# الأزرار
+# =========================
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    data = q.data or ""
+
+    if data == "home":
+        return await start(update, ctx)
+    if data == "wallet":
+        return await wallet(update, ctx)
+    if data == "orders":
+        return await my_orders(update, ctx)
+    if data == "topup":
+        return await topup(update, ctx)
+    if data == "confirm":
+        return await confirm_buy(update, ctx)
+    if data.startswith("cat:"):
+        return await open_cat(update, ctx, int(data.split(":")[1]))
+    if data.startswith("prod:"):
+        return await pick_product(update, ctx, int(data.split(":")[1]))
+    if data[:3] in ("od:", "of:", "dy:", "dn:"):
+        return await admin_action(update, ctx, data)
+
+
+async def admin_action(update: Update, ctx, data: str):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        return await q.answer("غير مصرح", show_alert=True)
+    kind, sid = data.split(":")
+    sid = int(sid)
+    bot = ctx.bot
+
+    if kind in ("od", "of"):
+        o = await fetch("SELECT * FROM orders WHERE id=?", sid, one=True)
+        if kind == "od":
+            ok = await settle("orders", sid, "done")
+        else:
+            ok = await settle("orders", sid, "failed", o["user_id"], o["price"])
+        if not ok:
+            return await q.answer("تمت معالجته مسبقاً", show_alert=True)
+        if kind == "od":
+            await notify_user(bot, o["user_id"], f"✅ تم تنفيذ طلبك <b>#{sid}</b> ({esc(o['product_name'])}) بنجاح 🎉")
+            await append_status(q, "✅ <b>تم التنفيذ</b>")
+        else:
+            await notify_user(bot, o["user_id"], f"❌ تعذّر تنفيذ طلبك <b>#{sid}</b> وتم إرجاع {money(o['price'])} إلى رصيدك.")
+            await append_status(q, "❌ <b>مرفوض وتم الاسترجاع</b>")
+    else:
+        d = await fetch("SELECT * FROM deposits WHERE id=?", sid, one=True)
+        if kind == "dy":
+            ok = await settle("deposits", sid, "approved", d["user_id"], d["amount"])
+        else:
+            ok = await settle("deposits", sid, "rejected")
+        if not ok:
+            return await q.answer("تمت معالجته مسبقاً", show_alert=True)
+        if kind == "dy":
+            await notify_user(bot, d["user_id"], f"✅ تمت الموافقة على الشحن <b>#{sid}</b>\n💰 أُضيف {money(d['amount'])} إلى رصيدك.")
+            await append_status(q, "✅ <b>تم القبول</b>")
+        else:
+            await notify_user(bot, d["user_id"], f"❌ تم رفض طلب الشحن <b>#{sid}</b>. تواصل مع الدعم إن كان هناك خطأ.")
+            await append_status(q, "❌ <b>تم الرفض</b>")
+
+
+# =========================
+# أوامر الأدمن
+# =========================
+def admin_only(fn):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            return
+        return await fn(update, ctx)
+    return wrapper
+
+
+def arg_text(update: Update) -> str:
+    parts = (update.message.text or "").split(" ", 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
+@admin_only
+async def admin_panel(update: Update, ctx):
+    users = (await fetch("SELECT COUNT(*) AS c FROM users", one=True))["c"]
+    pend_o = (await fetch("SELECT COUNT(*) AS c FROM orders WHERE status='pending'", one=True))["c"]
+    pend_d = (await fetch("SELECT COUNT(*) AS c FROM deposits WHERE status='pending'", one=True))["c"]
+    sales = (await fetch("SELECT COALESCE(SUM(price),0) AS s FROM orders WHERE status='done'", one=True))["s"]
+    await update.message.reply_text(
+        f"🛠 <b>لوحة الأدمن</b>\n\n👥 المستخدمون: {users}\n⏳ طلبات معلّقة: {pend_o}\n"
+        f"💳 شحن معلّق: {pend_d}\n💰 المبيعات: {money(sales)}\n\n"
+        "<b>الأوامر:</b>\n"
+        "/catalog — عرض الأقسام والمنتجات\n"
+        "/addcat الاسم|الإيموجي|نص الحقل المطلوب\n"
+        "/addprod رقم_القسم|الاسم|السعر\n"
+        "/setprice رقم_المنتج السعر\n"
+        "/delprod رقم_المنتج\n"
+        "/addbal رقم_المستخدم المبلغ\n"
+        "/broadcast النص")
+
+
+@admin_only
+async def catalog(update: Update, ctx):
+    out = []
+    for c in await fetch("SELECT * FROM categories ORDER BY id"):
+        out.append(f"{c['emoji']} <b>{esc(c['name'])}</b> (قسم {c['id']})")
+        for p in await fetch("SELECT * FROM products WHERE cat_id=? AND active=1 ORDER BY id", c["id"]):
+            out.append(f"   • [{p['id']}] {esc(p['name'])} — {money(p['price'])}")
+    await update.message.reply_text("\n".join(out) or "فارغ")
+
+
+@admin_only
+async def addcat(update: Update, ctx):
+    try:
+        name, emoji, label = [x.strip() for x in arg_text(update).split("|")]
+        assert name and emoji and label
+    except Exception:
+        return await update.message.reply_text("الصيغة: /addcat الاسم|🎮|نص الحقل المطلوب")
+    await run("INSERT INTO categories(name,emoji,label) VALUES(?,?,?)", name, emoji, label)
+    await update.message.reply_text("✅ تمت إضافة القسم")
+
+
+@admin_only
+async def addprod(update: Update, ctx):
+    try:
+        cid, name, price = [x.strip() for x in arg_text(update).split("|")]
+        await run("INSERT INTO products(cat_id,name,price) VALUES(?,?,?)", int(cid), name, float(price))
+    except Exception:
+        return await update.message.reply_text("الصيغة: /addprod رقم_القسم|الاسم|السعر")
+    await update.message.reply_text("✅ تمت إضافة المنتج")
+
+
+@admin_only
+async def setprice(update: Update, ctx):
+    try:
+        pid, price = ctx.args
+        await run("UPDATE products SET price=? WHERE id=?", float(price), int(pid))
+    except Exception:
+        return await update.message.reply_text("الصيغة: /setprice رقم_المنتج السعر")
+    await update.message.reply_text("✅ تم تحديث السعر")
+
+
+@admin_only
+async def delprod(update: Update, ctx):
+    try:
+        await run("UPDATE products SET active=0 WHERE id=?", int(ctx.args[0]))
+    except Exception:
+        return await update.message.reply_text("الصيغة: /delprod رقم_المنتج")
+    await update.message.reply_text("🗑 تم الحذف")
+
+
+@admin_only
+async def addbal(update: Update, ctx):
+    try:
+        uid, amt = int(ctx.args[0]), float(ctx.args[1])
+        n = await run("UPDATE users SET balance=ROUND((balance+?)::numeric,2) WHERE id=?", amt, uid)
+    except Exception:
+        return await update.message.reply_text("الصيغة: /addbal رقم_المستخدم المبلغ")
+    if n == 0:
+        return await update.message.reply_text("⚠️ المستخدم غير موجود (يجب أن يكون ضغط /start).")
+    await notify_user(ctx.bot, uid, f"💰 تمت إضافة {money(amt)} إلى رصيدك.")
+    await update.message.reply_text("✅ تم")
+
+
+@admin_only
+async def broadcast(update: Update, ctx):
+    text = arg_text(update).strip()
+    if not text:
+        return await update.message.reply_text("الصيغة: /broadcast النص")
+    ok = 0
+    for u in await fetch("SELECT id FROM users"):
+        try:
+            await ctx.bot.send_message(u["id"], text, parse_mode=None)
+            ok += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+    await update.message.reply_text(f"📣 أُرسلت إلى {ok} مستخدم")
+
+
+# =========================
+# التشغيل على Render (webhook)
+# =========================
+def _ping(url: str):
+    try:
+        urlopen(Request(url, headers={"User-Agent": "keepalive"}), timeout=20).read()
+    except Exception:
+        pass  # حتى لو رجع 404 فالطلب وصل وأبقى الخدمة مستيقظة
+
+
+async def self_ping():
+    if not RENDER_URL:
+        return
+    while True:
+        await asyncio.sleep(600)
+        await asyncio.to_thread(_ping, RENDER_URL)
+
+
+USER_COMMANDS = [("start", "القائمة الرئيسية"), ("cancel", "إلغاء العملية الحالية")]
+ADMIN_COMMANDS = USER_COMMANDS + [
+    ("admin", "لوحة الإدارة"), ("catalog", "الأقسام والمنتجات"),
+    ("addcat", "إضافة قسم"), ("addprod", "إضافة منتج"), ("setprice", "تعديل سعر"),
+    ("delprod", "حذف منتج"), ("addbal", "إضافة رصيد"), ("broadcast", "رسالة للجميع"),
+]
+
+
+async def post_init(app: Application):
+    await init_db()
+    try:
+        await app.bot.set_my_commands([BotCommand(c, d) for c, d in USER_COMMANDS])
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        for a in ADMINS:
+            try:
+                await app.bot.set_my_commands([BotCommand(c, d) for c, d in ADMIN_COMMANDS],
+                                              scope=BotCommandScopeChat(chat_id=a))
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Could not set bot commands")
+    app.bot_data["ping_task"] = asyncio.create_task(self_ping())
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN غير موجود في Environment")
-    init_db()
-    application = (
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL غير موجود في Environment")
+
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)
+        .defaults(Defaults(parse_mode=ParseMode.HTML))
         .post_init(post_init)
         .build()
     )
 
-    commands = {
-        "start": start,
-        "help": help_command,
-        "info": info_command,
-        "ask": ask_command,
-        "reset": reset_command,
-        "suggest": suggest_command,
-        "image": image_command,
-        "translate": translate_command,
-        "summarize": summarize_command,
-        "fix": fix_command,
-        "joke": joke_command,
-        "quote": quote_command,
-        "dice": dice_command,
-        "game": game_command,
-        "coin": coin_command,
-        "qr": qr_command,
-        "short": short_command,
-        "currency": currency_command,
-        "admin": admin_command,
-        "stats": stats_command,
-        "broadcast": broadcast_command,
+    handlers = {
+        "start": start, "cancel": cancel, "admin": admin_panel, "catalog": catalog,
+        "addcat": addcat, "addprod": addprod, "setprice": setprice, "delprod": delprod,
+        "addbal": addbal, "broadcast": broadcast,
     }
-    for name, handler in commands.items():
-        application.add_handler(CommandHandler(name, handler))
-
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_handler))
-    application.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & filters.ChatType.PRIVATE, voice_handler))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, chat_handler)
-    )
-    application.add_handler(MessageHandler(filters.ALL, track_user), group=1)
+    for name, fn in handlers.items():
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(
+        ((filters.TEXT & ~filters.COMMAND) | filters.PHOTO) & filters.ChatType.PRIVATE, on_message))
 
     if RENDER_URL:
-        webhook_url = f"{RENDER_URL}/{BOT_TOKEN}"
         logger.info("Starting Telegram webhook")
-        application.run_webhook(
+        app.run_webhook(
             listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN,
-            webhook_url=webhook_url, drop_pending_updates=False,
-        )
+            webhook_url=f"{RENDER_URL}/{BOT_TOKEN}", drop_pending_updates=False)
     else:
         logger.info("Starting Telegram polling")
-        application.run_polling()
+        app.run_polling()
+
 
 if __name__ == "__main__":
     main()
